@@ -1,4 +1,4 @@
-define('orbit-common', ['exports', 'orbit-common/main', 'orbit-common/cache', 'orbit-common/schema', 'orbit-common/serializer', 'orbit-common/source', 'orbit-common/memory-source', 'orbit-common/lib/exceptions'], function (exports, OC, Cache, Schema, Serializer, Source, MemorySource, exceptions) {
+define('orbit-common', ['exports', 'orbit-common/main', 'orbit-common/cache', 'orbit-common/schema', 'orbit-common/serializer', 'orbit-common/source', 'orbit-common/memory-source', 'orbit-common/operation-processors/operation-processor', 'orbit-common/operation-processors/cache-integrity-processor', 'orbit-common/operation-processors/deletion-tracking-processor', 'orbit-common/operation-processors/schema-consistency-processor', 'orbit-common/lib/exceptions'], function (exports, OC, Cache, Schema, Serializer, Source, MemorySource, OperationProcessor, CacheIntegrityProcessor, DeletionTrackingProcessor, SchemaConsistencyProcessor, exceptions) {
 
 	'use strict';
 
@@ -7,42 +7,29 @@ define('orbit-common', ['exports', 'orbit-common/main', 'orbit-common/cache', 'o
 	OC['default'].Serializer = Serializer['default'];
 	OC['default'].Source = Source['default'];
 	OC['default'].MemorySource = MemorySource['default'];
+	// operation processors
+	OC['default'].OperationProcessor = OperationProcessor['default'];
+	OC['default'].CacheIntegrityProcessor = CacheIntegrityProcessor['default'];
+	OC['default'].DeletionTrackingProcessor = DeletionTrackingProcessor['default'];
+	OC['default'].SchemaConsistencyProcessor = SchemaConsistencyProcessor['default'];
 	// exceptions
 	OC['default'].OperationNotAllowed = exceptions.OperationNotAllowed;
 	OC['default'].RecordNotFoundException = exceptions.RecordNotFoundException;
 	OC['default'].LinkNotFoundException = exceptions.LinkNotFoundException;
+	OC['default'].ModelNotRegisteredException = exceptions.ModelNotRegisteredException;
+	OC['default'].LinkNotRegisteredException = exceptions.LinkNotRegisteredException;
 	OC['default'].RecordAlreadyExistsException = exceptions.RecordAlreadyExistsException;
 
 	exports['default'] = OC['default'];
 
 });
-define('orbit-common/cache', ['exports', 'orbit/document', 'orbit/evented', 'orbit/operation', 'orbit/lib/objects', 'orbit-common/lib/exceptions', 'orbit/lib/eq', 'orbit/lib/deprecate'], function (exports, Document, Evented, Operation, objects, exceptions, eq, deprecate) {
+define('orbit-common/cache', ['exports', 'orbit/document', 'orbit/operation', 'orbit/lib/objects', 'orbit-common/lib/exceptions', 'orbit/lib/eq', 'orbit/lib/operations', 'orbit-common/operation-processors/cache-integrity-processor', 'orbit-common/operation-processors/schema-consistency-processor', 'orbit/transform-result', 'orbit/lib/diffs'], function (exports, Document, Operation, objects, exceptions, eq, operations, CacheIntegrityProcessor, SchemaConsistencyProcessor, TransformResult, diffs) {
 
   'use strict';
 
-  var Cache = objects.Class.extend({
+  exports['default'] = objects.Class.extend({
     init: function(schema, options) {
-      options = options || {};
-
-      if (options.trackRevLinks !== undefined && options.maintainRevLinks === undefined) {
-        deprecate.deprecate('Please convert usage of the Cache option `trackRevLinks` to `maintainRevLinks`.');
-        options.maintainRevLinks = options.trackRevLinks;
-      }
-
-      this.trackChanges = options.trackChanges !== undefined ? options.trackChanges : true;
-      this.maintainRevLinks = options.maintainRevLinks !== undefined ? options.maintainRevLinks : true;
-      this.maintainInverseLinks = options.maintainInverseLinks !== undefined ? options.maintainRevLinks : true;
-      this.maintainDependencies = options.maintainDependencies !== undefined ? options.maintainDependencies : true;
-
       this._doc = new Document['default'](null, {arrayBasedPaths: true});
-
-      if (this.maintainRevLinks) {
-        this._rev = {};
-      }
-
-      this._pathsToRemove = [];
-
-      Evented['default'].extend(this);
 
       this.schema = schema;
       for (var model in schema.models) {
@@ -51,8 +38,20 @@ define('orbit-common/cache', ['exports', 'orbit/document', 'orbit/evented', 'orb
         }
       }
 
+      options = options || {};
+      var processors = options.processors ? options.processors : [ SchemaConsistencyProcessor['default'], CacheIntegrityProcessor['default'] ];
+      this._initProcessors(processors);
+
       // TODO - clean up listener
       this.schema.on('modelRegistered', this._registerModel, this);
+    },
+
+    _initProcessors: function(processors) {
+      this._processors = processors.map(this._initProcessor, this);
+    },
+
+    _initProcessor: function(Processor) {
+      return new Processor(this);
     },
 
     _registerModel: function(model) {
@@ -65,6 +64,10 @@ define('orbit-common/cache', ['exports', 'orbit/document', 'orbit/evented', 'orb
     reset: function(data) {
       this._doc.reset(data);
       this.schema.registerAllKeys(data);
+
+      this._processors.forEach(function(processor) {
+        processor.reset(data);
+      });
     },
 
     /**
@@ -88,19 +91,14 @@ define('orbit-common/cache', ['exports', 'orbit/document', 'orbit/evented', 'orb
     /**
      Return data at a particular path.
 
-     Returns `null` if the path does not exist in the document.
+     Returns `undefined` if the path does not exist in the document.
 
      @method retrieve
      @param path
      @returns {Object}
      */
     retrieve: function(path) {
-      try {
-        // console.log('Cache#retrieve', path, this._doc.retrieve(path));
-        return this._doc.retrieve(path);
-      } catch(e) {
-        return undefined;
-      }
+      return this._doc.retrieve(path, true);
     },
 
     /**
@@ -130,12 +128,22 @@ define('orbit-common/cache', ['exports', 'orbit/document', 'orbit/evented', 'orb
      @returns {Boolean}
      */
     exists: function(path) {
-      try {
-        this._doc.retrieve(path);
-        return true;
-      } catch(e) {
-        return false;
-      }
+      return !!this._doc.retrieve(path, true);
+    },
+
+    /**
+     Returns whether a path has been removed from the document.
+
+     By default, this simply returns true if the path doesn't exist.
+     However, it may be overridden by an operations processor to provide more
+     advanced deletion tracking.
+
+     @method hasDeleted
+     @param path
+     @returns {Boolean}
+     */
+    hasDeleted: function(path) {
+      return !this.exists(path);
     },
 
     /**
@@ -143,613 +151,328 @@ define('orbit-common/cache', ['exports', 'orbit/document', 'orbit/evented', 'orb
 
      Currently limited to `add`, `remove` and `replace` operations.
 
-     Throws `PathNotFoundException` if the path does not exist in the document.
-
      @method transform
-     @param {Object} operation
-     @param {String} operation.op Must be "add", "remove", or "replace"
-     @param {Array or String} operation.path Path to target location
-     @param {Object} operation.value Value to set. Required for "add" and "replace"
-     @returns {Boolean} true if operation is applied or false
+     @param {Array} [ops] Array of operations
+     @returns {TransformResult} The result of applying the operations.
      */
-    transform: function(operation) {
-      var normalizedOperation;
-      if (operation instanceof Operation['default']) {
-        normalizedOperation = operation;
-      } else {
-        normalizedOperation = new Operation['default'](operation);
-      }
+    transform: function(ops) {
+      var result = new TransformResult['default']();
+      ops = this._prepareOperations(ops);
+      this._applyOperations(operations.normalizeOperations(ops), result);
+      return result;
+    },
 
-      var op = normalizedOperation.op;
-      var path = normalizedOperation.path;
-      var value = normalizedOperation.value;
-      var currentValue = this.retrieve(path);
-      var _this = this;
-      var dependentOperations = [];
-      var pushOps = function(ops) {
-        if (ops) {
-          if (ops.forEach) {
-            ops.forEach(function(op) {
-              if (op) dependentOperations.push(op);
-            });
-          } else {
-            dependentOperations.push(op);
-          }
-        }
-        return dependentOperations;
-      };
+    _prepareOperations: function(ops) {
+      var result = [];
 
-      var performDependentOps = function() {
-        dependentOperations.forEach(function(operation) {
-          _this.transform(operation);
-        });
-        dependentOperations = [];
-      };
-      var inverse;
+      ops.forEach(function(operation) {
+        var currentValue = this.retrieve(operation.path);
 
-      // console.log('Cache#transform', op, path.join('/'), value);
+        if (objects.isNone(currentValue)) {
 
-      if (op !== 'add' && op !== 'remove' && op !== 'replace') {
-        throw new exceptions.OperationNotAllowed('Cache#transform requires an "add", "remove" or "replace" operation.');
-      }
+          if (operation.op === 'remove' ||
+              (operation.op === 'replace' && objects.isNone(operation.value))) {
 
-      if (path.length < 2) {
-        throw new exceptions.OperationNotAllowed('Cache#transform requires an operation with a path >= 2 segments.');
-      }
-
-      if (op === 'add' || op === 'replace') {
-        if (!this.exists(path.slice(0, path.length - 1))) {
-          return false;
-        }
-
-      } else if (op === 'remove') {
-        if (this._isMarkedForRemoval(path)) {
-          // console.log('remove op not required because marked for removal', path);
-          return false;
-        }
-      }
-
-      if (eq.eq(currentValue, value)) return false;
-
-      if (this.maintainDependencies) {
-        pushOps(this._dependentOps(normalizedOperation));
-      }
-
-      if (op === 'remove' || op === 'replace') {
-        this._markForRemoval(path);
-
-        if (this.maintainInverseLinks) {
-          if (op === 'replace') {
-            pushOps(this._relatedInverseLinkOps(normalizedOperation.spawn({
-              op: 'remove',
-              path: path
-            })));
+            // Removing a null value, or replacing it with another null value, is unnecessary
+            if (this.hasDeleted(operation.path)) return;
           }
 
-          pushOps(this._relatedInverseLinkOps(normalizedOperation));
-        }
-
-        if (this.maintainRevLinks) {
-          this._removeRevLinks(path, normalizedOperation);
-        }
-      }
-
-      if (this.trackChanges) {
-        inverse = this._doc.transform(normalizedOperation, true);
-        this.emit('didTransform',
-                  normalizedOperation,
-                  inverse);
-
-      } else {
-        this._doc.transform(normalizedOperation, false);
-      }
-
-      performDependentOps();
-
-      if (op === 'remove' || op === 'replace') {
-        this._unmarkForRemoval(path);
-      }
-
-      if (op === 'add' || op === 'replace') {
-        if (this.maintainRevLinks) {
-          this._addRevLinks(path, value, normalizedOperation);
-        }
-
-        if (this.maintainInverseLinks) {
-          if (op === 'replace') {
-            pushOps(this._relatedInverseLinkOps(normalizedOperation.spawn({
-              op: 'add',
-              path: path,
-              value: value
-            })));
+        } else if (operation.op === 'add' || operation.op === 'replace') {
+          if (eq.eq(currentValue, operation.value)) {
+            // Replacing a value with its equivalent is unnecessary
+            return;
 
           } else {
-            pushOps(this._relatedInverseLinkOps(normalizedOperation));
-          }
-        }
-      }
-
-      performDependentOps();
-
-      return true;
-    },
-
-    _markForRemoval: function(path) {
-      path = path.join('/');
-      // console.log('_markForRemoval', path);
-      this._pathsToRemove.push(path);
-    },
-
-    _unmarkForRemoval: function(path) {
-      path = path.join('/');
-      var i = this._pathsToRemove.indexOf(path);
-      // console.log('_unmarkForRemoval', path, i);
-      if (i > -1) this._pathsToRemove.splice(i, 1);
-    },
-
-    _isMarkedForRemoval: function(path) {
-      path = path.join('/');
-      // console.log('_isMarkedForRemoval', path);
-      return (this._pathsToRemove.indexOf(path) > -1);
-    },
-
-    _isOperationRequired: function(operation) {
-      if (operation.op === 'remove') {
-        if (this._isMarkedForRemoval(operation.path)) {
-          // console.log('remove op not required because marked for removal', operation.path);
-          return false;
-        }
-      }
-
-      var currentValue = this.retrieve(operation.path);
-      var desiredValue = operation.value;
-
-      // console.log('op required', !eq(currentValue, desiredValue), operation);
-
-      return !eq.eq(currentValue, desiredValue);
-    },
-
-    _dependentOps: function(operation) {
-      var operations = [];
-      if (operation.op === 'remove' && operation.path.length === 2) {
-        var _this = this,
-          type = operation.path[0],
-          id = operation.path[1],
-          links = _this.schema.models[type].links;
-
-        Object.keys(links).forEach(function(link) {
-          var linkSchema = links[link];
-          if (linkSchema.dependent !== 'remove') {
+            var diffOps = diffs.diffs(currentValue, operation.value, { basePath: operation.path });
+            Array.prototype.push.apply(result, operations.normalizeOperations(diffOps));
             return;
           }
-
-          var linkValue = _this.retrieveLink(type, id, link);
-          if (linkValue) {
-            [].concat(linkValue).forEach(function(value) {
-              var dependentPath = [linkSchema.model, value];
-              if (_this.retrieve(dependentPath)) {
-                operations.push(operation.spawn({
-                  op: 'remove',
-                  path: dependentPath
-                }));
-              }
-            });
-          }
-        });
-
-      }
-
-      return operations;
-    },
-
-    _addRevLinks: function(path, value) {
-      // console.log('_addRevLinks', path, value);
-
-      if (value) {
-        var _this = this,
-            type = path[0],
-            id = path[1],
-            linkSchema,
-            linkValue;
-
-        if (path.length === 2) {
-          // when a whole record is added, add inverse links for every link
-          if (value.__rel) {
-            Object.keys(value.__rel).forEach(function(link) {
-              linkSchema = _this.schema.models[type].links[link];
-              linkValue = value.__rel[link];
-
-              if (linkSchema.type === 'hasMany') {
-                Object.keys(linkValue).forEach(function(v) {
-                  _this._addRevLink(linkSchema, type, id, link, v);
-                });
-
-              } else {
-                _this._addRevLink(linkSchema, type, id, link, linkValue);
-              }
-            });
-          }
-
-        } else if (path.length > 3) {
-          var link = path[3];
-
-          linkSchema = _this.schema.models[type].links[link];
-
-          if (path.length === 5) {
-            linkValue = path[4];
-          } else {
-            linkValue = value;
-          }
-
-          this._addRevLink(linkSchema, type, id, link, linkValue);
         }
-      }
+
+        result.push(operation);
+      }, this);
+
+      return result;
     },
 
-    _revLink: function(type, id) {
-      var revForType = this._rev[type];
-      if (revForType === undefined) {
-        revForType = this._rev[type] = {};
-      }
-      var rev = revForType[id];
-      if (rev === undefined) {
-        rev = revForType[id] = {};
-      }
-      return rev;
+    _applyOperations: function(ops, result) {
+      ops.forEach(function(op) {
+        this._applyOperation(op, result);
+      }, this);
     },
 
-    _addRevLink: function(linkSchema, type, id, link, value) {
-      // console.log('_addRevLink', linkSchema, type, id, link, value);
-
-      if (value && typeof value === 'string') {
-        var linkPath = [type, id, '__rel', link];
-        if (linkSchema.type === 'hasMany') {
-          linkPath.push(value);
-        }
-        linkPath = linkPath.join('/');
-
-        var revLink = this._revLink(linkSchema.model, value);
-        revLink[linkPath] = true;
-      }
-    },
-
-    _removeRevLinks: function(path, parentOperation) {
-      // console.log('_removeRevLinks', path);
-
-      var value = this.retrieve(path);
-      if (value) {
-        var _this = this,
-            type = path[0],
-            id = path[1],
-            linkSchema,
-            linkValue;
-
-        if (path.length === 2) {
-          // when a whole record is removed, remove any links that reference it
-          if (this.maintainRevLinks) {
-            var revLink = this._revLink(type, id);
-            var operation;
-
-            Object.keys(revLink).forEach(function(path) {
-              path = _this._doc.deserializePath(path);
-
-              if (path.length === 4) {
-                operation = parentOperation.spawn({
-                  op: 'replace',
-                  path: path,
-                  value: null
-                });
-              } else {
-                operation = parentOperation.spawn({
-                  op: 'remove',
-                  path: path
-                });
-              }
-
-              _this.transform(operation);
-            });
-
-            delete this._rev[type][id];
-          }
-
-          // when a whole record is removed, remove references corresponding to each link
-          if (value.__rel) {
-            Object.keys(value.__rel).forEach(function(link) {
-              linkSchema = _this.schema.models[type].links[link];
-              linkValue = value.__rel[link];
-
-              if (linkSchema.type === 'hasMany') {
-                Object.keys(linkValue).forEach(function(v) {
-                  _this._removeRevLink(linkSchema, type, id, link, v);
-                });
-
-              } else {
-                _this._removeRevLink(linkSchema, type, id, link, linkValue);
-              }
-            });
-          }
-
-        } else if (path.length > 3) {
-          var link = path[3];
-
-          linkSchema = _this.schema.models[type].links[link];
-
-          if (path.length === 5) {
-            linkValue = path[4];
-          } else {
-            linkValue = value;
-          }
-
-          this._removeRevLink(linkSchema, type, id, link, linkValue);
-        }
-      }
-    },
-
-    _removeRevLink: function(linkSchema, type, id, link, value) {
-      // console.log('_removeRevLink', linkSchema, type, id, link, value);
-
-      if (value && typeof value === 'string') {
-        var linkPath = [type, id, '__rel', link];
-        if (linkSchema.type === 'hasMany') {
-          linkPath.push(value);
-        }
-        linkPath = linkPath.join('/');
-
-        var revLink = this._revLink(linkSchema.model, id);
-        delete revLink[linkPath];
-      }
-    },
-
-    _relatedInverseLinkOps: function(operation) {
+    _applyOperation: function(operation, result) {
       var _this = this;
       var op = operation.op;
       var path = operation.path;
       var value = operation.value;
-      var type = path[0];
-      var record;
-      var key;
-      var linkDef;
-      var linkValue;
-      var inverseLinkOp;
-      var relId;
-      var ops = [];
+      var currentValue = this.retrieve(path);
+      var relatedOps = [];
 
-      if (op === 'add') {
-        if (path.length > 3 && path[2] === '__rel') {
+      function concatRelatedOps(ops) {
+        relatedOps = relatedOps.concat(ops);
+      }
 
-          key = path[3];
-          linkDef = this.schema.models[type].links[key];
+      function applyRelatedOps() {
+        _this._applyOperations(relatedOps, result);
+        relatedOps = [];
+      }
 
-          if (linkDef.inverse) {
-            if (path.length > 4) {
-              relId = path[4];
-            } else {
-              relId = value;
-            }
+      function applyOp(op) {
+        result.push(op, _this._doc.transform(op, true));
+      }
 
-            if (objects.isObject(relId)) {
-              Object.keys(relId).forEach(function(id) {
-                ops.push(_this._relatedAddLinkOp(
-                  linkDef.model,
-                  id,
-                  linkDef.inverse,
-                  path[1],
-                  operation
-                ));
-              });
+      // console.log('Cache#transform', op, path.join('/'), value);
 
-            } else {
-              ops.push(_this._relatedAddLinkOp(
-                linkDef.model,
-                relId,
-                linkDef.inverse,
-                path[1],
-                operation
-              ));
-            }
-          }
+      // special case the addition of a `type` collection
+      if (op === 'add' && path.length === 1) {
+        applyOp(operation);
+        return;
+      }
 
-        } else if (path.length === 2) {
-
-          record = operation.value;
-          if (record.__rel) {
-            Object.keys(record.__rel).forEach(function(key) {
-              linkDef = _this.schema.models[type].links[key];
-
-              if (linkDef.inverse) {
-                if (linkDef.type === 'hasMany') {
-                  Object.keys(record.__rel[key]).forEach(function(id) {
-                    ops.push(_this._relatedAddLinkOp(
-                      linkDef.model,
-                      id,
-                      linkDef.inverse,
-                      path[1],
-                      operation
-                    ));
-                  });
-
-                } else {
-                  var id = record.__rel[key];
-
-                  if (!objects.isNone(id)) {
-                    ops.push(_this._relatedAddLinkOp(
-                      linkDef.model,
-                      id,
-                      linkDef.inverse,
-                      path[1],
-                      operation
-                    ));
-                  }
-                }
-              }
-            });
-          }
-        }
-
-      } else if (op === 'remove') {
-
-        if (path.length > 3 && path[2] === '__rel') {
-
-          key = path[3];
-          linkDef = this.schema.models[type].links[key];
-
-          if (linkDef.inverse) {
-            if (path.length > 4) {
-              relId = path[4];
-            } else {
-              relId = this.retrieve(path);
-            }
-
-            if (relId) {
-              if (objects.isObject(relId)) {
-                Object.keys(relId).forEach(function(id) {
-                  ops.push(_this._relatedRemoveLinkOp(
-                    linkDef.model,
-                    id,
-                    linkDef.inverse,
-                    path[1],
-                    operation
-                  ));
-                });
-
-              } else {
-                ops.push(_this._relatedRemoveLinkOp(
-                  linkDef.model,
-                  relId,
-                  linkDef.inverse,
-                  path[1],
-                  operation
-                ));
-              }
-            }
-          }
-
-        } else if (path.length === 2) {
-
-          record = this.retrieve(path);
-          if (record.__rel) {
-            Object.keys(record.__rel).forEach(function(key) {
-              linkDef = _this.schema.models[type].links[key];
-
-              if (linkDef.inverse) {
-                if (linkDef.type === 'hasMany') {
-                  Object.keys(record.__rel[key]).forEach(function(id) {
-                    ops.push(_this._relatedRemoveLinkOp(
-                      linkDef.model,
-                      id,
-                      linkDef.inverse,
-                      path[1],
-                      operation
-                    ));
-                  });
-
-                } else {
-                  var id = record.__rel[key];
-
-                  if (!objects.isNone(id)) {
-                    ops.push(_this._relatedRemoveLinkOp(
-                      linkDef.model,
-                      id,
-                      linkDef.inverse,
-                      path[1],
-                      operation
-                    ));
-                  }
-                }
-              }
-            });
-          }
+      if (op === 'add' || op === 'replace') {
+        if (!this.exists(path.slice(0, path.length - 1))) {
+          return;
         }
       }
-      return ops;
-    },
 
-    _relatedAddLinkOp: function(type, id, key, value, parentOperation) {
-      // console.log('_relatedAddLinkOp', type, id, key, value);
+      // console.log('Cache#transform', op, path.join('/'), value);
 
-      if (this.retrieve([type, id])) {
-        var op = this._addLinkOp(type, id, key, value);
+      if (eq.eq(currentValue, value)) return;
 
-        // Apply operation only if necessary
-        if (this.retrieve(op.path) !== op.value) {
-          return parentOperation.spawn(op);
-        }
-      }
-    },
-
-    _relatedRemoveLinkOp: function(type, id, key, value, parentOperation) {
-      // console.log('_relatedRemoveLinkOp', type, id, key, value);
-
-      var op = this._removeLinkOp(type, id, key, value);
-
-      // Apply operation only if necessary
-      if (this.retrieve(op.path) && !this._isMarkedForRemoval(op.path)) {
-        return parentOperation.spawn(op);
-      }
-    },
-
-    _addLinkOp: function(type, id, key, value) {
-      var linkDef = this.schema.models[type].links[key];
-      var path = [type, id, '__rel', key];
-      var op;
-
-      if (linkDef.type === 'hasMany') {
-        path.push(value);
-        value = true;
-        op = 'add';
-      } else {
-        op = 'replace';
-      }
-
-      return new Operation['default']({
-        op: op,
-        path: path,
-        value: value
+      // Query and perform related `before` operations
+      this._processors.forEach(function(processor) {
+        concatRelatedOps(processor.before(operation));
       });
-    },
+      applyRelatedOps();
 
-    _removeLinkOp: function(type, id, key, value) {
-      var linkDef = this.schema.models[type].links[key];
-      var path = [type, id, '__rel', key];
-      var op;
-
-      if (linkDef.type === 'hasMany') {
-        path.push(value);
-        op = 'remove';
-      } else {
-        op = 'replace';
-        value = null;
-      }
-
-      return new Operation['default']({
-        op: op,
-        path: path,
-        value: value
+      // Query related `after` operations before performing
+      // the requested operation
+      this._processors.forEach(function(processor) {
+        concatRelatedOps(processor.after(operation));
       });
-    },
 
-    _updateLinkOp: function(type, id, key, value) {
-      var linkDef = this.schema.models[type].links[key];
-      var path = [type, id, '__rel', key];
+      // Perform the requested operation
+      applyOp(operation);
 
-      if (linkDef.type === 'hasMany' &&
-          objects.isArray(value)) {
-        var obj = {};
-        for (var i = 0, l = value.length; i < l; i++) {
-          obj[value[i]] = true;
-        }
-        value = obj;
-      }
+      // Perform related `after` operations after performing
+      // the requested operation
+      applyRelatedOps();
 
-      return new Operation['default']({
-        op: 'replace',
-        path: path,
-        value: value
+      // Query and perform related `finally` operations
+      this._processors.forEach(function(processor) {
+        concatRelatedOps(processor.finally(operation));
       });
+      applyRelatedOps();
     }
   });
 
-  exports['default'] = Cache;
+});
+define('orbit-common/jsonapi-patch-source', function () {
+
+	'use strict';
+
+	// import { isArray, isObject } from 'orbit/lib/objects';
+	// import JSONAPISource from './jsonapi-source';
+	//
+	// /**
+	//  Source for accessing a JSON API compliant RESTful API with AJAX using the
+	//  official patch extension
+	//
+	//  @class JSONAPIPatchSource
+	//  @extends Source
+	//  @namespace OC
+	//  @param schema
+	//  @param options
+	//  @constructor
+	//  */
+	// export default JSONAPISource.extend({
+	//
+	//   /////////////////////////////////////////////////////////////////////////////
+	//   // Internals
+	//   /////////////////////////////////////////////////////////////////////////////
+	//
+	//   _transformAdd: function(operation) {
+	//     var _this = this;
+	//     var type = operation.path[0];
+	//     var id = operation.path[1];
+	//
+	//     var remoteOp = {
+	//       op: 'add',
+	//       path: '/-',
+	//       value: this.serializer.serializeRecord(type, operation.value)
+	//     };
+	//
+	//     return this.ajax(this.resourceURL(type), 'PATCH', {data: [ remoteOp ]}).then(
+	//       function(raw) {
+	//         if (raw && isArray(raw)) {
+	//           _this.deserialize(type, id, raw[0], operation);
+	//         } else {
+	//           _this._transformCache(operation);
+	//         }
+	//       }
+	//     );
+	//   },
+	//
+	//   _transformReplace: function(operation) {
+	//     var _this = this;
+	//     var type = operation.path[0];
+	//     var id = operation.path[1];
+	//     var value = operation.value;
+	//
+	//     var remoteOp = {
+	//       op: 'replace',
+	//       path: '/',
+	//       value: this.serializer.serializeRecord(type, value)
+	//     };
+	//
+	//     return this.ajax(this.resourceURL(type, id), 'PATCH', {data: [ remoteOp ]}).then(
+	//       function(raw) {
+	//         if (raw && isArray(raw)) {
+	//           _this.deserialize(type, id, raw[0], operation);
+	//         } else {
+	//           _this._transformCache(operation);
+	//         }
+	//       }
+	//     );
+	//   },
+	//
+	//   _transformRemove: function(operation) {
+	//     var _this = this;
+	//     var type = operation.path[0];
+	//     var id = operation.path[1];
+	//
+	//     var remoteOp = {
+	//       op: 'remove',
+	//       path: '/'
+	//     };
+	//
+	//     return this.ajax(this.resourceURL(type, id), 'PATCH', {data: [ remoteOp ]}).then(
+	//       function() {
+	//         _this._transformCache(operation);
+	//       }
+	//     );
+	//   },
+	//
+	//   _transformAddLink: function(operation) {
+	//     var _this = this;
+	//
+	//     var type = operation.path[0];
+	//     var id = operation.path[1];
+	//     var link = operation.path[3];
+	//     var relId = operation.path[4] || operation.value;
+	//     var linkDef = this.schema.linkDefinition(type, link);
+	//     var relType = linkDef.model;
+	//     var relResourceId = this.serializer.resourceId(relType, relId);
+	//     var remoteOp;
+	//
+	//     if (linkDef.type === 'hasMany') {
+	//       remoteOp = {
+	//         op: 'add',
+	//         path: '/-',
+	//         value: relResourceId
+	//       };
+	//     } else {
+	//       remoteOp = {
+	//         op: 'replace',
+	//         path: '/',
+	//         value: relResourceId
+	//       };
+	//     }
+	//
+	//     return this.ajax(this.resourceLinkURL(type, id, link), 'PATCH', {data: [ remoteOp ]}).then(
+	//       function() {
+	//         _this._transformCache(operation);
+	//       }
+	//     );
+	//   },
+	//
+	//   _transformRemoveLink: function(operation) {
+	//     var _this = this;
+	//
+	//     var type = operation.path[0];
+	//     var id = operation.path[1];
+	//     var link = operation.path[3];
+	//     var linkDef = this.schema.linkDefinition(type, link);
+	//     var remoteOp;
+	//
+	//     if (linkDef.type === 'hasMany') {
+	//       var relId = operation.path[4];
+	//       var relType = linkDef.model;
+	//       var relResourceId = this.serializer.resourceId(relType, relId);
+	//
+	//       remoteOp = {
+	//         op: 'remove',
+	//         path: '/' + relResourceId
+	//       };
+	//     } else {
+	//       remoteOp = {
+	//         op: 'remove',
+	//         path: '/'
+	//       };
+	//     }
+	//
+	//     return this.ajax(this.resourceLinkURL(type, id, link), 'PATCH', {data: [ remoteOp ]}).then(
+	//       function() {
+	//         _this._transformCache(operation);
+	//       }
+	//     );
+	//   },
+	//
+	//   _transformReplaceLink: function(operation) {
+	//     var _this = this;
+	//
+	//     var type = operation.path[0];
+	//     var id = operation.path[1];
+	//     var link = operation.path[3];
+	//     var relId = operation.path[4] || operation.value;
+	//
+	//     // Convert a map of ids to an array
+	//     if (isObject(relId)) {
+	//       relId = Object.keys(relId);
+	//     }
+	//
+	//     var linkDef = this.schema.linkDefinition(type, link);
+	//     var relType = linkDef.model;
+	//     var relResourceId = this.serializer.resourceId(relType, relId);
+	//     var remoteOp;
+	//
+	//     remoteOp = {
+	//       op: 'replace',
+	//       path: '/',
+	//       value: relResourceId
+	//     };
+	//
+	//     return this.ajax(this.resourceLinkURL(type, id, link), 'PATCH', {data: [ remoteOp ]}).then(
+	//       function() {
+	//         _this._transformCache(operation);
+	//       }
+	//     );
+	//   },
+	//
+	//   _transformUpdateAttribute: function(operation) {
+	//     var _this = this;
+	//     var type = operation.path[0];
+	//     var id = operation.path[1];
+	//     var attr = operation.path[2];
+	//
+	//     var remoteOp = {
+	//       op: 'replace',
+	//       path: '/' + attr,
+	//       value: operation.value
+	//     };
+	//
+	//     return this.ajax(this.resourceURL(type, id), 'PATCH', {data: [ remoteOp ]}).then(
+	//       function() {
+	//         _this._transformCache(operation);
+	//       }
+	//     );
+	//   },
+	//
+	//   ajaxContentType: function(url, method) {
+	//     return 'application/vnd.api+json; ext=jsonpatch; charset=utf-8';
+	//   }
+	// });
 
 });
 define('orbit-common/lib/exceptions', ['exports', 'orbit/lib/exceptions'], function (exports, exceptions) {
@@ -758,6 +481,27 @@ define('orbit-common/lib/exceptions', ['exports', 'orbit/lib/exceptions'], funct
 
   var OperationNotAllowed = exceptions.Exception.extend({
     name: 'OC.OperationNotAllowed',
+    init: function(message, operation) {
+      this.operation = operation;
+      this._super(message);
+    }
+  });
+
+  var ModelNotRegisteredException = exceptions.Exception.extend({
+    name: 'OC.ModelNotRegisteredException',
+    init: function(model) {
+      this.model = model;
+      this._super('model "' + model + '" not found');
+    },
+  });
+
+  var LinkNotRegisteredException = exceptions.Exception.extend({
+    name: 'OC.LinkNotRegisteredException',
+    init: function(model, link) {
+      this.model = model;
+      this.link = link;
+      this._super('link "' + model + "#" + link + '" not registered');
+    },
   });
 
 
@@ -818,6 +562,8 @@ define('orbit-common/lib/exceptions', ['exports', 'orbit/lib/exceptions'], funct
   exports.RecordNotFoundException = RecordNotFoundException;
   exports.LinkNotFoundException = LinkNotFoundException;
   exports.RecordAlreadyExistsException = RecordAlreadyExistsException;
+  exports.ModelNotRegisteredException = ModelNotRegisteredException;
+  exports.LinkNotRegisteredException = LinkNotRegisteredException;
 
 });
 define('orbit-common/main', ['exports'], function (exports) {
@@ -848,36 +594,39 @@ define('orbit-common/main', ['exports'], function (exports) {
 	exports['default'] = OC;
 
 });
-define('orbit-common/memory-source', ['exports', 'orbit/main', 'orbit/lib/assert', 'orbit/lib/objects', 'orbit-common/source', 'orbit-common/lib/exceptions'], function (exports, Orbit, assert, objects, Source, exceptions) {
+define('orbit-common/memory-source', ['exports', 'orbit/main', 'orbit/lib/assert', 'orbit/lib/objects', 'orbit-common/source', 'orbit-common/operation-processors/cache-integrity-processor', 'orbit-common/operation-processors/schema-consistency-processor', 'orbit-common/lib/exceptions'], function (exports, Orbit, assert, objects, Source, CacheIntegrityProcessor, SchemaConsistencyProcessor, exceptions) {
 
   'use strict';
 
   var MemorySource = Source['default'].extend({
     init: function(schema, options) {
       assert.assert('MemorySource requires Orbit.Promise to be defined', Orbit['default'].Promise);
-      this._super.apply(this, arguments);
+      options = options || {};
+      options.useCache = true;
+      options.cacheOptions = options.cacheOptions || {};
+      options.cacheOptions.processors =  options.cacheOptions.processors || [SchemaConsistencyProcessor['default'], CacheIntegrityProcessor['default']];
+      this._super.call(this, schema, options);
     },
 
     /////////////////////////////////////////////////////////////////////////////
     // Transformable interface implementation
     /////////////////////////////////////////////////////////////////////////////
 
-    _transform: function(operation) {
-      // Transform the cache
-      // Note: the cache's didTransform event will trigger this source's
-      // didTransform event.
-      this._cache.transform(operation);
+    _transform: function(ops) {
+      return this._cache.transform(ops);
     },
 
     /////////////////////////////////////////////////////////////////////////////
     // Requestable interface implementation
     /////////////////////////////////////////////////////////////////////////////
 
-    _find: function(type, id) {
+    _find: function(type, id, options) {
       var _this = this,
-          modelSchema = this.schema.models[type],
-          pk = modelSchema.primaryKey.name,
+          modelDefinition = this.schema.modelDefinition(type),
+          pk = modelDefinition.primaryKey.name,
           result;
+
+      options = options || {};
 
       return new Orbit['default'].Promise(function(resolve, reject) {
         if (objects.isNone(id)) {
@@ -907,17 +656,27 @@ define('orbit-common/memory-source', ['exports', 'orbit/main', 'orbit/lib/assert
             result = null;
             id = notFound;
           }
+          else if (options.include) {
+            _this._fetchRecords(type, id, options);
+          }
 
         } else if (id !== null && typeof id === 'object') {
           if (id[pk]) {
-            result = _this.retrieve([type, id[pk]]);
+            result = _this._fetchRecord(type, id[pk], options);
 
           } else {
             result = _this._filter.call(_this, type, id);
+
+            // If all keys in our query were keys, always return a single record.
+            if (Object.keys(id).every(function(key) {
+              return modelDefinition.keys[key];
+            })) {
+              result = result[0];
+            }
           }
 
         } else {
-          result = _this.retrieve([type, id]);
+          result = _this._fetchRecord(type, id, options);
         }
 
         if (result) {
@@ -926,6 +685,63 @@ define('orbit-common/memory-source', ['exports', 'orbit/main', 'orbit/lib/assert
           reject(new exceptions.RecordNotFoundException(type, id));
         }
       });
+    },
+
+    _fetchRecords: function(type, ids, options) {
+      var records = [];
+
+      for (var i = 0, l = ids.length; i < l; i++) {
+        var record = this._fetchRecord(type, ids[i], options);
+        records.push(record);
+      }
+
+      return records;
+    },
+
+    _fetchRecord: function(type, id, options) {
+      var _this = this;
+      var record = this.retrieve([type, id]);
+      if (!record) throw new exceptions.RecordNotFoundException(type, id);
+
+      var include = this._parseInclude(options.include);
+
+      if (include) {
+        Object.keys(include).forEach(function(link) {
+          _this._fetchLinked(type, id, link, objects.merge(options, {include: include[link]}));
+        });
+      }
+
+      return record;
+    },
+
+    _fetchLinked: function(type, id, link, options) {
+      var linkType = this.schema.modelDefinition(type).links[link].model;
+      var linkValue = this.retrieveLink(type, id, link);
+
+      if (linkValue === undefined) throw new exceptions.LinkNotFoundException(type, id, link);
+      if (linkValue === null) return null;
+
+      return objects.isArray(linkValue)
+             ? this._fetchRecords(linkType, linkValue, options)
+             : this._fetchRecord(linkType, linkValue, options);
+    },
+
+    _parseInclude: function(include) {
+      if (!include) return undefined;
+      if (objects.isObject(include) && !objects.isArray(include)) return include;
+      if (!objects.isArray(include)) include = [include];
+
+      var parsed = {};
+
+      include.forEach(function(inclusion) {
+        var current = parsed;
+        inclusion.split(".").forEach(function(link) {
+          current[link] = current[link] || {};
+          current = current[link];
+        });
+      });
+
+      return parsed;
     },
 
     _findLink: function(type, id, link) {
@@ -943,7 +759,7 @@ define('orbit-common/memory-source', ['exports', 'orbit/main', 'orbit/lib/assert
             relId = record.__rel[link];
 
             if (relId) {
-              var linkDef = _this.schema.models[type].links[link];
+              var linkDef = _this.schema.linkDefinition(type, link);
               if (linkDef.type === 'hasMany') {
                 relId = Object.keys(relId);
               }
@@ -1020,7 +836,688 @@ define('orbit-common/memory-source', ['exports', 'orbit/main', 'orbit/lib/assert
   exports['default'] = MemorySource;
 
 });
-define('orbit-common/schema', ['exports', 'orbit/lib/objects', 'orbit/lib/uuid', 'orbit-common/lib/exceptions', 'orbit/evented'], function (exports, objects, uuid, exceptions, Evented) {
+define('orbit-common/operation-encoder', ['exports', 'orbit/lib/objects', 'orbit-common/lib/exceptions', 'orbit/operation'], function (exports, objects, exceptions, Operation) {
+
+  'use strict';
+
+  exports['default'] = objects.Class.extend({
+    init: function(schema) {
+      this._schema = schema;
+    },
+
+    identify: function(operation) {
+      var op = operation.op;
+      var path = operation.path;
+      var value = operation.value;
+
+      if (['add', 'replace', 'remove'].indexOf(op) === -1) throw new exceptions.OperationNotAllowed("Op must be add, replace or remove (was " + op + ")", operation);
+
+      if (path.length < 2) throw new exceptions.OperationNotAllowed("Path must have at least 2 segments");
+      if (path.length === 2) return op + "Record";
+      if (path.length === 3) return op + "Attribute";
+
+      if (path[2] === '__rel') {
+        var linkType = this._schema.linkDefinition(path[0], path[3]).type;
+
+        if (linkType === 'hasMany') {
+          if (path.length === 4) {
+            if (objects.isObject(value) && ['add', 'replace'].indexOf(op) !== -1) return op + 'HasMany';
+            if (op === 'remove') return 'removeHasMany';
+          }
+          else if (path.length === 5) {
+            if (op === 'add') return 'addToHasMany';
+            if (op === 'remove') return 'removeFromHasMany';
+          }
+        }
+        else if (linkType === 'hasOne') {
+          return op + 'HasOne';
+        }
+        else {
+          throw new exceptions.OperationNotAllowed("Only hasMany and hasOne links are supported (was " + linkType + ")", operation);
+        }
+      }
+
+      throw new exceptions.OperationNotAllowed("Invalid operation " + operation.op + ":" + operation.path.join("/") + ":" + operation.value);
+    },
+
+    addRecordOp: function(type, id, record) {
+      return new Operation['default']({op: 'add', path: [type, id], value: record});
+    },
+
+    replaceRecordOp: function(type, id, record) {
+      return new Operation['default']({op: 'replace', path: [type, id], value: record});
+    },
+
+    removeRecordOp: function(type, id) {
+      return new Operation['default']({op: 'remove', path: [type, id]});
+    },
+
+    replaceAttributeOp: function(type, id, attribute, value) {
+      var path = [type, id, attribute];
+      return new Operation['default']({op: 'replace', path: path, value: value});
+    },
+
+    linkOp: function(op, type, id, key, value) {
+      return this[op + 'LinkOp'](type, id, key, value);
+    },
+
+    addLinkOp: function(type, id, key, value) {
+      var linkType = this._schema.linkDefinition(type, key).type;
+      var path = [type, id, '__rel', key];
+      var op;
+
+      if (linkType === 'hasMany') {
+        path.push(value);
+        value = true;
+        op = 'add';
+      } else {
+        op = 'replace';
+      }
+
+      return new Operation['default']({
+        op: op,
+        path: path,
+        value: value
+      });
+    },
+
+    replaceLinkOp: function(type, id, key, value) {
+      var linkType = this._schema.linkDefinition(type, key).type;
+      var path = [type, id, '__rel', key];
+
+      if (linkType === 'hasMany' &&
+          objects.isArray(value)) {
+        var obj = {};
+        for (var i = 0, l = value.length; i < l; i++) {
+          obj[value[i]] = true;
+        }
+        value = obj;
+      }
+
+      return new Operation['default']({
+        op: 'replace',
+        path: path,
+        value: value
+      });
+    },
+
+    removeLinkOp: function(type, id, key, value) {
+      var linkType = this._schema.linkDefinition(type, key).type;
+      var path = [type, id, '__rel', key];
+      var op;
+
+      if (linkType === 'hasMany') {
+        path.push(value);
+        op = 'remove';
+      } else {
+        op = 'replace';
+        value = null;
+      }
+
+      return new Operation['default']({
+        op: op,
+        path: path,
+        value: value
+      });
+    }
+  });
+
+});
+define('orbit-common/operation-processors/cache-integrity-processor', ['exports', 'orbit/lib/objects', 'orbit/operation', 'orbit-common/operation-processors/operation-processor'], function (exports, objects, Operation, OperationProcessor) {
+
+  'use strict';
+
+  exports['default'] = OperationProcessor['default'].extend({
+    init: function(cache) {
+      this._super.apply(this, arguments);
+      this._rev = {};
+    },
+
+    _rev: null,
+
+    reset: function(data) {
+      this._rev = {};
+
+      if (data) {
+        Object.keys(data).forEach(function(type) {
+          var typeData = data[type];
+          Object.keys(typeData).forEach(function(id) {
+            this._recordAdded(type, id, typeData[id]);
+          }, this);
+        }, this);
+      }
+    },
+
+    before: function(operation) {
+      var path = operation.path;
+      var type = path[0];
+      var id = path[1];
+      var operationType = this.cache.schema.operationEncoder.identify(operation);
+
+      switch (operationType) {
+        case 'addRecord':
+          return this._beforeRecordAdded(type, id);
+
+        default:
+          return [];
+      }
+    },
+
+    after: function(operation) {
+      var path = operation.path;
+      var type = path[0];
+      var id = path[1];
+      var operationType = this.cache.schema.operationEncoder.identify(operation);
+
+      switch (operationType) {
+        case 'replaceHasOne':
+        case 'replaceHasMany':
+        case 'removeHasOne':
+        case 'removeHasMany':
+          return this._linkRemoved(type, id, path[3]);
+
+        case 'removeFromHasMany':
+          return this._linkRemoved(type, id, path[3], path[4]);
+
+        case 'removeRecord':
+          return this._recordRemoved(type, id);
+
+        default:
+          return [];
+      }
+    },
+
+    finally: function(operation) {
+      var path = operation.path;
+      var type = path[0];
+      var id = path[1];
+      var value = operation.value;
+      var operationType = this.cache.schema.operationEncoder.identify(operation);
+
+      switch (operationType) {
+        case 'replaceHasOne':
+        case 'replaceHasMany':
+        case 'addHasOne':
+        case 'addHasMany':
+          return this._linkAdded(type, id, path[3], value);
+
+        case 'addToHasMany':
+          return this._linkAdded(type, id, path[3], path[4]);
+
+        case 'addRecord':
+          return this._recordAdded(type, id, value);
+
+        default:
+          return [];
+      }
+    },
+
+    _linkAdded: function(type, id, link, value) {
+      var ops = [];
+      var linkDef = this.cache.schema.linkDefinition(type, link);
+
+      if (linkDef.inverse && !objects.isNone(value)) {
+        var relIds = this._idsFromValue(value);
+        var relId;
+
+        for (var i = 0; i < relIds.length; i++) {
+          relId = relIds[i];
+          this._addRevLink(type, id, link, relId);
+        }
+      }
+
+      return ops;
+    },
+
+    _linkRemoved: function(type, id, link, value) {
+      var ops = [];
+      var linkDef = this.cache.schema.linkDefinition(type, link);
+
+      if (linkDef.inverse) {
+        if (value === undefined) {
+          value = this.cache.retrieve([type, id, '__rel', link]);
+        }
+
+        if (!objects.isNone(value)) {
+          var relIds = this._idsFromValue(value);
+          var relId;
+
+          for (var i = 0; i < relIds.length; i++) {
+            relId = relIds[i];
+            this._removeRevLink(type, id, link, relId);
+          }
+        }
+      }
+
+      return ops;
+    },
+
+    _beforeRecordAdded: function(type, id, record) {
+      var ops = [];
+
+      var modelRootPath = [type];
+      if (!this.cache.retrieve(modelRootPath)) {
+        ops.push(new Operation['default']({
+          op: 'add',
+          path: modelRootPath,
+          value: {}
+        }));
+      }
+
+      return ops;
+    },
+
+    _recordAdded: function(type, id, record) {
+      var ops = [];
+      var links = record.__rel;
+
+      if (links) {
+        var linkValue;
+
+        Object.keys(links).forEach(function(link) {
+          linkValue = links[link];
+          if (linkValue) {
+            var relIds = this._idsFromValue(linkValue);
+            var relId;
+
+            for (var i = 0; i < relIds.length; i++) {
+              relId = relIds[i];
+              this._addRevLink(type, id, link, relId);
+            }
+          }
+        }, this);
+      }
+
+      return ops;
+    },
+
+    _recordRemoved: function(type, id) {
+      var ops = [];
+      var revLink = this._revLink(type, id);
+
+      if (revLink) {
+        Object.keys(revLink).forEach(function(path) {
+          path = path.split('/');
+
+          if (path.length === 4) {
+            ops.push(new Operation['default']({
+              op: 'replace',
+              path: path,
+              value: null
+            }));
+
+          } else {
+            ops.push(new Operation['default']({
+              op: 'remove',
+              path: path
+            }));
+          }
+        }, this);
+
+        delete this._rev[type][id];
+      }
+
+      // when a whole record is removed, remove references corresponding to each link
+      var links = this.cache.retrieve([type, id, '__rel']);
+      if (links) {
+        var linkValue;
+
+        Object.keys(links).forEach(function(link) {
+          linkValue = links[link];
+          if (linkValue) {
+            var relIds = this._idsFromValue(linkValue);
+            var relId;
+
+            for (var i = 0; i < relIds.length; i++) {
+              relId = relIds[i];
+              this._removeRevLink(type, id, link, relId);
+            }
+          }
+        }, this);
+      }
+
+      return ops;
+    },
+
+    _idsFromValue: function(value) {
+      if (objects.isArray(value)) {
+        return value;
+      } else if (objects.isObject(value)) {
+        return Object.keys(value);
+      } else {
+        return [ value ];
+      }
+    },
+
+    _revLink: function(type, id) {
+      var revForType = this._rev[type];
+      if (revForType === undefined) {
+        revForType = this._rev[type] = {};
+      }
+      var rev = revForType[id];
+      if (rev === undefined) {
+        rev = revForType[id] = {};
+      }
+      return rev;
+    },
+
+    _addRevLink: function(type, id, link, value) {
+      // console.log('_addRevLink', type, id, link, value);
+
+      if (value) {
+        var linkDef = this.cache.schema.linkDefinition(type, link);
+        var linkPath = [type, id, '__rel', link];
+
+        if (linkDef.type === 'hasMany') {
+          linkPath.push(value);
+        }
+        linkPath = linkPath.join('/');
+
+        var revLink = this._revLink(linkDef.model, value);
+        revLink[linkPath] = true;
+      }
+    },
+
+    _removeRevLink: function(type, id, link, value) {
+      // console.log('_removeRevLink', type, id, link, value);
+
+      if (value) {
+        var linkDef = this.cache.schema.linkDefinition(type, link);
+        var linkPath = [type, id, '__rel', link];
+
+        if (linkDef.type === 'hasMany') {
+          linkPath.push(value);
+        }
+        linkPath = linkPath.join('/');
+
+        var revLink = this._revLink(linkDef.model, value);
+        delete revLink[linkPath];
+      }
+    }
+  });
+
+});
+define('orbit-common/operation-processors/deletion-tracking-processor', ['exports', 'orbit/lib/objects', 'orbit/operation', 'orbit-common/operation-processors/operation-processor'], function (exports, objects, Operation, OperationProcessor) {
+
+  'use strict';
+
+  exports['default'] = OperationProcessor['default'].extend({
+    init: function(cache) {
+      this._super.apply(this, arguments);
+      this._del = {};
+      objects.expose(cache, this, 'hasDeleted');
+    },
+
+    _del: null,
+
+    hasDeleted: function(path) {
+      if (objects.isArray(path)) path = path.join('/');
+      return !!this._del[path];
+    },
+
+    reset: function(data) {
+      this._del = {};
+    },
+
+    finally: function(operation) {
+      if (operation.op === 'remove') {
+        var serializedPath = operation.path.join('/');
+        this._del[serializedPath] = true;
+      }
+
+      return [];
+    }
+  });
+
+});
+define('orbit-common/operation-processors/operation-processor', ['exports', 'orbit/lib/objects'], function (exports, objects) {
+
+  'use strict';
+
+  exports['default'] = objects.Class.extend({
+    init: function(cache) {
+      this.cache = cache;
+    },
+
+    cache: null,
+
+    /**
+     Called when all the `data` in a cache has been reset.
+
+     The return value is ignored.
+
+     @param  {Object} [data] a complete replacement set of data
+     */
+    reset: function(data) {},
+
+    /**
+     Called before an `operation` has been applied.
+
+     Return an array of operations to be applied **BEFORE** the `operation` itself
+     is applied.
+
+     @param  {OC.Operation} [operation]
+     @return {Array} an array of `OC.Operation` objects
+     */
+    before: function(operation) {
+      return [];
+    },
+
+    /**
+     Called before an `operation` has been applied.
+
+     Return an array of operations to be applied **AFTER** the `operation` itself
+     is applied.
+
+     @param  {OC.Operation} [operation]
+     @return {Array} an array of `OC.Operation` objects
+     */
+    after: function(operation) {
+      return [];
+    },
+
+    /**
+     Called **AFTER** an `operation` and any related operations have been
+     applied.
+
+     Return an array of operations to be applied **AFTER** `operation` itself
+     is applied.
+
+     @param  {OC.Operation} [operation]
+     @return {Array} an array of `OC.Operation` objects
+     */
+    finally: function(operation) {
+      return [];
+    }
+  });
+
+});
+define('orbit-common/operation-processors/schema-consistency-processor', ['exports', 'orbit/lib/objects', 'orbit/operation', 'orbit-common/operation-processors/operation-processor'], function (exports, objects, Operation, OperationProcessor) {
+
+  'use strict';
+
+  exports['default'] = OperationProcessor['default'].extend({
+    after: function(operation) {
+      var path = operation.path;
+      var type = path[0];
+      var id = path[1];
+      var operationType = this.cache.schema.operationEncoder.identify(operation);
+
+      switch (operationType) {
+        case 'replaceHasOne':
+        case 'replaceHasMany':
+        case 'removeHasOne':
+        case 'removeHasMany':
+          return this._linkRemoved(type, id, path[3]);
+
+        case 'removeFromHasMany':
+          return this._linkRemoved(type, id, path[3], path[4]);
+
+        case 'removeRecord':
+          return this._recordRemoved(type, id);
+
+        default:
+          return [];
+      }
+    },
+
+    finally: function(operation) {
+      var path = operation.path;
+      var type = path[0];
+      var id = path[1];
+      var value = operation.value;
+      var operationType = this.cache.schema.operationEncoder.identify(operation);
+
+      switch (operationType) {
+        case 'replaceHasOne':
+        case 'replaceHasMany':
+        case 'addHasOne':
+        case 'addHasMany':
+          return this._linkAdded(type, id, path[3], value);
+
+        case 'addToHasMany':
+          return this._linkAdded(type, id, path[3], path[4]);
+
+        case 'addRecord':
+          return this._recordAdded(type, id, value);
+
+        default:
+          return [];
+      }
+    },
+
+    _linkAdded: function(type, id, link, value) {
+      var ops = [];
+      var linkDef = this.cache.schema.linkDefinition(type, link);
+
+      if (linkDef.inverse && !objects.isNone(value)) {
+        var relIds = this._idsFromValue(value);
+        var relId;
+        var op;
+
+        for (var i = 0; i < relIds.length; i++) {
+          relId = relIds[i];
+          op = this._relatedLinkOp('add', linkDef.model, relId, linkDef.inverse, id);
+          if (op) ops.push(op);
+        }
+      }
+      return ops;
+    },
+
+    _linkRemoved: function(type, id, link, value) {
+      var ops = [];
+      var linkDef = this.cache.schema.linkDefinition(type, link);
+
+      if (linkDef.inverse) {
+        if (value === undefined) {
+          value = this.cache.retrieve([type, id, '__rel', link]);
+        }
+
+        if (!objects.isNone(value)) {
+          var relIds = this._idsFromValue(value);
+          var relId;
+          var op;
+
+          for (var i = 0; i < relIds.length; i++) {
+            relId = relIds[i];
+            op = this._relatedLinkOp('remove', linkDef.model, relId, linkDef.inverse, id);
+            if (op) ops.push(op);
+          }
+        }
+      }
+
+      return ops;
+    },
+
+    _recordAdded: function(type, id, record) {
+      var ops = [];
+      var links = record.__rel;
+
+      if (links) {
+        var linkValue;
+
+        Object.keys(links).forEach(function(link) {
+          linkValue = links[link];
+          if (linkValue) {
+            ops = ops.concat(this._linkAdded(type, id, link, linkValue));
+          }
+        }, this);
+      }
+
+      return ops;
+    },
+
+    _recordRemoved: function(type, id) {
+      var ops = [];
+      var links = this.cache.retrieve([type, id, '__rel']);
+
+      if (links) {
+        var linkDef;
+        var linkValue;
+
+        Object.keys(links).forEach(function(link) {
+          linkValue = links[link];
+          if (linkValue) {
+            linkDef = this.cache.schema.linkDefinition(type, link);
+
+            if (linkDef.dependent === 'remove') {
+              ops = ops.concat(this._removeDependentRecords(linkDef.model, linkValue));
+            } else {
+              ops = ops.concat(this._linkRemoved(type, id, link, linkValue));
+            }
+          }
+        }, this);
+      }
+
+      return ops;
+    },
+
+    _removeDependentRecords: function(type, idOrIds) {
+      var ops = [];
+      var ids = this._idsFromValue(idOrIds);
+      var id;
+      var dependentPath;
+
+      for (var i = 0; i < ids.length; i++) {
+        id = ids[i];
+        dependentPath = [type, id];
+        if (this.cache.retrieve(dependentPath)) {
+          ops.push({
+            op: 'remove',
+            path: dependentPath
+          });
+        }
+      }
+
+      return ops;
+    },
+
+    _idsFromValue: function(value) {
+      if (objects.isArray(value)) {
+        return value;
+      } else if (objects.isObject(value)) {
+        return Object.keys(value);
+      } else {
+        return [ value ];
+      }
+    },
+
+    _relatedLinkOp: function(op, type, id, link, value) {
+      // console.log('_relatedLinkOp', op, type, id, link, value);
+      if (this.cache.retrieve([type, id])) {
+        var operation = this.cache.schema.operationEncoder.linkOp(op, type, id, link, value);
+
+        // Apply operation only if necessary
+        if (this.cache.retrieve(operation.path) !== operation.value) {
+          // console.log('_relatedLinkOp - necessary', op, type, id, link, value);
+          return operation;
+        }
+      }
+    }
+  });
+
+});
+define('orbit-common/schema', ['exports', 'orbit/lib/objects', 'orbit/lib/uuid', 'orbit-common/lib/exceptions', 'orbit/evented', 'orbit-common/operation-encoder'], function (exports, objects, uuid, exceptions, Evented, OperationEncoder) {
 
   'use strict';
 
@@ -1056,7 +1553,15 @@ define('orbit-common/schema', ['exports', 'orbit/lib/objects', 'orbit/lib/uuid',
           }
         }
       }
+
+      this.operationEncoder = new OperationEncoder['default'](this);
     },
+
+    /**
+     @property operationEncoder
+     @type OperationEncoder
+     */
+    operationEncoder: null,
 
     /**
      Registers a model's schema definition.
@@ -1139,12 +1644,20 @@ define('orbit-common/schema', ['exports', 'orbit/lib/objects', 'orbit/lib/uuid',
       return record;
     },
 
+    modelDefinition: function(model) {
+      var modelSchema = this.models[model];
+      if (!modelSchema) {
+        throw new exceptions.ModelNotRegisteredException(model);
+      }
+      return modelSchema;
+    },
+
     initDefaults: function(model, record) {
       if (!record.__normalized) {
         throw new exceptions.OperationNotAllowed('Schema.initDefaults requires a normalized record');
       }
 
-      var modelSchema = this.models[model],
+      var modelSchema = this.modelDefinition(model),
           keys = modelSchema.keys,
           attributes = modelSchema.attributes,
           links = modelSchema.links;
@@ -1183,7 +1696,7 @@ define('orbit-common/schema', ['exports', 'orbit/lib/objects', 'orbit/lib/uuid',
     },
 
     primaryToSecondaryKey: function(model, secondaryKeyName, primaryKeyValue, autoGenerate) {
-      var modelSchema = this.models[model];
+      var modelSchema = this.modelDefinition(model);
       var secondaryKey = modelSchema.keys[secondaryKeyName];
 
       var value = secondaryKey.primaryToSecondaryKeyMap[primaryKeyValue];
@@ -1198,7 +1711,7 @@ define('orbit-common/schema', ['exports', 'orbit/lib/objects', 'orbit/lib/uuid',
     },
 
     secondaryToPrimaryKey: function(model, secondaryKeyName, secondaryKeyValue, autoGenerate) {
-      var modelSchema = this.models[model];
+      var modelSchema = this.modelDefinition(model);
       var secondaryKey = modelSchema.keys[secondaryKeyName];
 
       var value = secondaryKey.secondaryToPrimaryKeyMap[secondaryKeyValue];
@@ -1222,7 +1735,7 @@ define('orbit-common/schema', ['exports', 'orbit/lib/objects', 'orbit/lib/uuid',
     registerAllKeys: function(data) {
       if (data) {
         Object.keys(data).forEach(function(type) {
-          var modelSchema = this.models[type];
+          var modelSchema = this.modelDefinition(type);
 
           if (modelSchema && modelSchema.secondaryKeys) {
             var records = data[type];
@@ -1274,6 +1787,15 @@ define('orbit-common/schema', ['exports', 'orbit/lib/objects', 'orbit/lib/uuid',
       }
     },
 
+    linkDefinition: function(type, link) {
+      var model = this.modelDefinition(type);
+
+      var linkProperties = model.links[link];
+      if (!linkProperties) throw new exceptions.LinkNotRegisteredException(type, link);
+
+      return linkProperties;
+    },
+
     _defaultValue: function(record, value, defaultValue) {
       if (value === undefined) {
         return defaultValue;
@@ -1293,7 +1815,7 @@ define('orbit-common/schema', ['exports', 'orbit/lib/objects', 'orbit/lib/uuid',
       // init primary key from secondary keys
       if (!id && modelSchema.secondaryKeys) {
         var keyNames = Object.keys(modelSchema.secondaryKeys);
-        for (var i=0, l = keyNames.length; i <l ; i++){
+        for (var i = 0, l = keyNames.length; i < l ; i++) {
           var key = modelSchema.keys[keyNames[i]];
           var value = record[key.name];
           if (value) {
@@ -1381,7 +1903,7 @@ define('orbit-common/serializer', ['exports', 'orbit/lib/objects', 'orbit/lib/st
   exports['default'] = Serializer;
 
 });
-define('orbit-common/source', ['exports', 'orbit/main', 'orbit/document', 'orbit/transformable', 'orbit/requestable', 'orbit/lib/assert', 'orbit/lib/stubs', 'orbit/lib/objects', 'orbit-common/cache', 'orbit/operation'], function (exports, Orbit, Document, Transformable, Requestable, assert, stubs, objects, Cache, Operation) {
+define('orbit-common/source', ['exports', 'orbit/main', 'orbit/document', 'orbit/transformable', 'orbit/requestable', 'orbit/lib/assert', 'orbit/lib/stubs', 'orbit/lib/objects', 'orbit-common/cache', 'orbit/operation', 'orbit-common/lib/exceptions', 'orbit/lib/eq', 'orbit/lib/diffs', 'orbit/lib/operations'], function (exports, Orbit, Document, Transformable, Requestable, assert, stubs, objects, Cache, Operation, exceptions, eq, diffs, operations) {
 
   'use strict';
 
@@ -1394,12 +1916,10 @@ define('orbit-common/source', ['exports', 'orbit/main', 'orbit/document', 'orbit
       options = options || {};
 
       // Create an internal cache and expose some elements of its interface
-      this._cache = new Cache['default'](schema);
-      objects.expose(this, this._cache,
-             'length', 'reset', 'retrieve', 'retrieveLink',
-             '_addLinkOp', '_removeLinkOp', '_updateLinkOp');
-      // TODO - clean up listener
-      this._cache.on('didTransform', this._cacheDidTransform, this);
+      if (options.useCache) {
+        this._cache = new Cache['default'](schema, options.cacheOptions);
+        objects.expose(this, this._cache, 'length', 'reset', 'retrieve', 'retrieveLink', 'exists', 'hasDeleted');
+      }
 
       Transformable['default'].extend(this);
       Requestable['default'].extend(this, ['find', 'add', 'update', 'patch', 'remove',
@@ -1414,19 +1934,74 @@ define('orbit-common/source', ['exports', 'orbit/main', 'orbit/document', 'orbit
     /////////////////////////////////////////////////////////////////////////////
 
     /**
-     Internal method that applies a single transform to this source.
+     Internal method that applies an array of transforms to this source.
 
      `_transform` must be implemented by a `Transformable` source.
      It is called by the public method `transform` in order to actually apply
      transforms.
 
-     `_transform` should return a promise if the operation is asynchronous.
+     For synchronous transforms, `_transform` should return a TransformResult.
+
+     For asynchronous transforms, `_transform` should return a promise that
+     resolves to a TransformResult.
 
      @method _transform
-     @param operation JSON PATCH operation as detailed in RFC 6902
+     @param {Array} [operations] An array of Orbit.Operation objects
+     @returns {Promise | TransformResult} An Orbit.TransformResult or Promise that resolves to a Orbit.TransformResult
      @private
      */
     _transform: stubs.required,
+
+    /**
+     Prepare an array of operations for `_transform`.
+
+     This is an opportunity to coalesce operations, removing those that aren't
+     needed for this source.
+
+     @method prepareTransformOperations
+     @param {Array} [operations] An array of Orbit.Operation objects
+     @returns {Array} An array of Orbit.Operation objects
+     @private
+     */
+    prepareTransformOperations: function(ops) {
+      var result;
+      var coalescedOps = operations.coalesceOperations(ops);
+
+      if (this.retrieve) {
+        result = [];
+
+        coalescedOps.forEach(function(operation) {
+          var currentValue = this.retrieve(operation.path);
+
+          if (objects.isNone(currentValue)) {
+            // Removing a null value, or replacing it with another null value, is unnecessary
+            if ((operation.op === 'remove') ||
+                (operation.op === 'replace' && objects.isNone(operation.value))) {
+
+              if (this.hasDeleted && this.hasDeleted(operation.path)) return;
+            }
+
+          } else if (operation.op === 'add' || operation.op === 'replace') {
+            if (eq.eq(currentValue, operation.value)) {
+              // Replacing a value with its equivalent is unnecessary
+              return;
+
+            } else {
+              var diffOps = diffs.diffs(currentValue, operation.value, { basePath: operation.path });
+              Array.prototype.push.apply(result, operations.normalizeOperations(diffOps));
+              return;
+            }
+          }
+
+          result.push(operation);
+        }, this);
+
+      } else {
+        result = coalescedOps;
+      }
+
+      return result;
+    },
 
     /////////////////////////////////////////////////////////////////////////////
     // Requestable interface implementation
@@ -1436,34 +2011,15 @@ define('orbit-common/source', ['exports', 'orbit/main', 'orbit/document', 'orbit
 
     _findLink: stubs.required,
 
-    _findLinked: function(type, id, link, relId) {
-      var _this = this;
-      var linkDef = _this.schema.models[type].links[link];
-      var relType = linkDef.model;
+    _findLinked: function(type, id, link, options) {
+      var modelId = this.getId(type, id);
+      var linkType = this.schema.linkDefinition(type, link).model;
+      var linkValue = this.retrieveLink(type, modelId, link);
 
-      id = this.getId(type, id);
+      if (linkValue === undefined) throw new exceptions.LinkNotFoundException(type, id, link);
+      if (linkValue === null) return null;
 
-      if (relId === undefined) {
-        relId = this.retrieveLink(type, id, link);
-      }
-
-      if (this._isLinkEmpty(linkDef.type, relId)) {
-        return new Orbit['default'].Promise(function(resolve) {
-          resolve(relId);
-        });
-
-      } else if (relId) {
-        return this.find(relType, relId);
-
-      } else {
-        return this.findLink(type, id, link).then(function(relId) {
-          if (_this._isLinkEmpty(linkDef.type, relId)) {
-            return relId;
-          } else {
-            return _this.find(relType, relId);
-          }
-        });
-      }
+      return this._find(linkType, linkValue, options);
     },
 
     _add: function(type, data) {
@@ -1475,7 +2031,7 @@ define('orbit-common/source', ['exports', 'orbit/main', 'orbit/document', 'orbit
           path = [type, id],
           _this = this;
 
-      return this.transform({op: 'add', path: path, value: record}).then(function() {
+      return this.transform(this.schema.operationEncoder.addRecordOp(type, id, record)).then(function() {
         return _this.retrieve(path);
       });
     },
@@ -1483,41 +2039,37 @@ define('orbit-common/source', ['exports', 'orbit/main', 'orbit/document', 'orbit
     _update: function(type, data) {
       var record = this.normalize(type, data);
       var id = this.getId(type, record);
-      var path = [type, id];
 
-      return this.transform({op: 'replace', path: path, value: record});
+      return this.transform(this.schema.operationEncoder.replaceRecordOp(type, id, record));
     },
 
-    _patch: function(type, id, property, value) {
+    _patch: function(type, id, attribute, value) {
       id = this._normalizeId(type, id);
-      var path = [type, id].concat(Document['default'].prototype.deserializePath(property));
-
-      return this.transform({op: 'replace', path: path, value: value});
+      // todo - confirm this simplification is valid (i.e. don't attempt to deserialize attribute path)
+      return this.transform(this.schema.operationEncoder.replaceAttributeOp(type, id, attribute, value));
     },
 
     _remove: function(type, id) {
       id = this._normalizeId(type, id);
-      var path = [type, id];
-
-      return this.transform({op: 'remove', path: path});
+      return this.transform(this.schema.operationEncoder.removeRecordOp(type, id));
     },
 
     _addLink: function(type, id, key, value) {
       id = this._normalizeId(type, id);
       value = this._normalizeLink(type, key, value);
 
-      return this.transform(this._addLinkOp(type, id, key, value));
+      return this.transform(this.schema.operationEncoder.addLinkOp(type, id, key, value));
     },
 
     _removeLink: function(type, id, key, value) {
       id = this._normalizeId(type, id);
       value = this._normalizeLink(type, key, value);
 
-      return this.transform(this._removeLinkOp(type, id, key, value));
+      return this.transform(this.schema.operationEncoder.removeLinkOp(type, id, key, value));
     },
 
     _updateLink: function(type, id, key, value) {
-      var linkDef = this.schema.models[type].links[key];
+      var linkDef = this.schema.modelDefinition(type).links[key];
 
       assert.assert('hasMany links can only be replaced when flagged as `actsAsSet`',
              linkDef.type !== 'hasMany' || linkDef.actsAsSet);
@@ -1525,16 +2077,8 @@ define('orbit-common/source', ['exports', 'orbit/main', 'orbit/document', 'orbit
       id = this._normalizeId(type, id);
       value = this._normalizeLink(type, key, value);
 
-      var op = this._updateLinkOp(type, id, key, value);
+      var op = this.schema.operationEncoder.replaceLinkOp(type, id, key, value);
       return this.transform(op);
-    },
-
-    /////////////////////////////////////////////////////////////////////////////
-    // Event handlers
-    /////////////////////////////////////////////////////////////////////////////
-
-    _cacheDidTransform: function(operation, inverse) {
-      this.didTransform(operation, inverse);
     },
 
     /////////////////////////////////////////////////////////////////////////////
@@ -1551,7 +2095,7 @@ define('orbit-common/source', ['exports', 'orbit/main', 'orbit/document', 'orbit
 
     _normalizeLink: function(type, key, value) {
       if (objects.isObject(value)) {
-        var linkDef = this.schema.models[type].links[key];
+        var linkDef = this.schema.modelDefinition(type).links[key];
         var relatedRecord;
 
         if (objects.isArray(value)) {
@@ -1580,7 +2124,7 @@ define('orbit-common/source', ['exports', 'orbit/main', 'orbit/document', 'orbit
 
     getId: function(type, data) {
       if (objects.isObject(data)) {
-        return data[this.schema.models[type].primaryKey.name];
+        return data[this.schema.modelDefinition(type).primaryKey.name];
       } else {
         return data;
       }
