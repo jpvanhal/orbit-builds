@@ -4,7 +4,7 @@
 var define = window.Orbit.__define__;
 var requireModule = window.Orbit.__requireModule__;
 
-define('orbit-common', ['exports', 'orbit-common/main', 'orbit-common/cache', 'orbit-common/schema', 'orbit-common/serializer', 'orbit-common/source', 'orbit-common/memory-source', 'orbit-common/operation-processors/operation-processor', 'orbit-common/operation-processors/cache-integrity-processor', 'orbit-common/operation-processors/deletion-tracking-processor', 'orbit-common/operation-processors/schema-consistency-processor', 'orbit-common/lib/exceptions'], function (exports, OC, Cache, Schema, Serializer, Source, MemorySource, OperationProcessor, CacheIntegrityProcessor, DeletionTrackingProcessor, SchemaConsistencyProcessor, exceptions) {
+define('orbit-common', ['exports', 'orbit-common/main', 'orbit-common/cache', 'orbit-common/schema', 'orbit-common/serializer', 'orbit-common/source', 'orbit-common/memory-source', 'orbit-common/transaction', 'orbit-common/operation-processors/operation-processor', 'orbit-common/operation-processors/cache-integrity-processor', 'orbit-common/operation-processors/deletion-tracking-processor', 'orbit-common/operation-processors/schema-consistency-processor', 'orbit-common/lib/exceptions'], function (exports, OC, Cache, Schema, Serializer, Source, MemorySource, Transaction, OperationProcessor, CacheIntegrityProcessor, DeletionTrackingProcessor, SchemaConsistencyProcessor, exceptions) {
 
 	'use strict';
 
@@ -13,6 +13,7 @@ define('orbit-common', ['exports', 'orbit-common/main', 'orbit-common/cache', 'o
 	OC['default'].Serializer = Serializer['default'];
 	OC['default'].Source = Source['default'];
 	OC['default'].MemorySource = MemorySource['default'];
+	OC['default'].Transaction = Transaction['default'];
 	// operation processors
 	OC['default'].OperationProcessor = OperationProcessor['default'];
 	OC['default'].CacheIntegrityProcessor = CacheIntegrityProcessor['default'];
@@ -35,21 +36,29 @@ define('orbit-common/cache', ['exports', 'orbit/document', 'orbit/operation', 'o
 
   exports['default'] = objects.Class.extend({
     init: function(schema, options) {
-      this._doc = new Document['default'](null, {arrayBasedPaths: true});
-
       this.schema = schema;
-      for (var model in schema.models) {
-        if (schema.models.hasOwnProperty(model)) {
-          this._registerModel(model);
-        }
-      }
+
+      this._doc = new Document['default'](null, {arrayBasedPaths: true});
 
       options = options || {};
       var processors = options.processors ? options.processors : [ SchemaConsistencyProcessor['default'], CacheIntegrityProcessor['default'] ];
       this._initProcessors(processors);
 
-      // TODO - clean up listener
-      this.schema.on('modelRegistered', this._registerModel, this);
+      this.sparse = options.sparse === undefined ? true : options.sparse;
+
+      // Non-sparse caches should pre-fill data for all models in a schema.
+      if (!this.sparse) {
+        // Pre-register all models.
+        for (var model in schema.models) {
+          if (schema.models.hasOwnProperty(model)) {
+            this.registerModel(model);
+          }
+        }
+
+        // Automatically fill data for models as they're registered.
+        // TODO - clean up listener
+        this.schema.on('modelRegistered', this.registerModel, this);
+      }
     },
 
     _initProcessors: function(processors) {
@@ -60,11 +69,18 @@ define('orbit-common/cache', ['exports', 'orbit/document', 'orbit/operation', 'o
       return new Processor(this);
     },
 
-    _registerModel: function(model) {
-      var modelRootPath = [model];
-      if (!this.retrieve(modelRootPath)) {
-        this._doc.add(modelRootPath, {});
+    _fillSparsePath: function(path) {
+      var p;
+      for (var i = 0, l = path.length; i < l; i++) {
+        p = path.slice(0, i + 1);
+        if (!this.exists(p)) {
+          this._doc.add(p, {});
+        }
       }
+    },
+
+    registerModel: function(model) {
+      this._fillSparsePath([model]);
     },
 
     reset: function(data) {
@@ -74,24 +90,6 @@ define('orbit-common/cache', ['exports', 'orbit/document', 'orbit/operation', 'o
       this._processors.forEach(function(processor) {
         processor.reset(data);
       });
-    },
-
-    /**
-     Return the size of data at a particular path
-
-     @method length
-     @param path
-     @returns {Number}
-     */
-    length: function(path) {
-      var data = this.retrieve(path);
-      if (data === null || data === undefined) {
-        return data;
-      } else if (objects.isArray(data)) {
-        return data.length;
-      } else {
-        return Object.keys(data).length;
-      }
     },
 
     /**
@@ -108,23 +106,22 @@ define('orbit-common/cache', ['exports', 'orbit/document', 'orbit/operation', 'o
     },
 
     /**
-     * Retrieves a link value.  Returns a null value for empty links.
-     * For hasOne links will return a string id value of the link.
-     * For hasMany links will return an array of id values.
-     *
-     * @param  {String} type Model Type.
-     * @param  {String} id   Model ID.
-     * @param  {String} link Link Key.
-     * @return {Array|String|null}      The value of the link
-     */
-    retrieveLink: function(type, id, link) {
-      var val = this.retrieve([type, id, '__rel', link]);
-      if (val !== null && typeof val === 'object') {
-        val = Object.keys(val);
-      }
-      return val;
-    },
+     Return the size of data at a particular path
 
+     @method length
+     @param path
+     @returns {Number}
+     */
+    length: function(path) {
+      var data = this.retrieve(path);
+      if (objects.isArray(data)) {
+        return data.length;
+      } else if (objects.isObject(data)) {
+        return Object.keys(data).length;
+      } else {
+        return 0;
+      }
+    },
 
     /**
      Returns whether a path exists in the document.
@@ -134,7 +131,7 @@ define('orbit-common/cache', ['exports', 'orbit/document', 'orbit/operation', 'o
      @returns {Boolean}
      */
     exists: function(path) {
-      return !!this._doc.retrieve(path, true);
+      return this.retrieve(path) !== undefined;
     },
 
     /**
@@ -237,8 +234,15 @@ define('orbit-common/cache', ['exports', 'orbit/document', 'orbit/operation', 'o
       }
 
       if (op === 'add' || op === 'replace') {
-        if (!this.exists(path.slice(0, path.length - 1))) {
-          return;
+        if (path.length > 1) {
+          var parentPath = path.slice(0, path.length - 1);
+          if (!this.exists(parentPath)) {
+            if (this.sparse && !objects.isNone(value)) {
+              this._fillSparsePath(parentPath);
+            } else {
+              return;
+            }
+          }
         }
       }
 
@@ -600,18 +604,18 @@ define('orbit-common/main', ['exports'], function (exports) {
 	exports['default'] = OC;
 
 });
-define('orbit-common/memory-source', ['exports', 'orbit/main', 'orbit/lib/assert', 'orbit/lib/objects', 'orbit-common/source', 'orbit-common/operation-processors/cache-integrity-processor', 'orbit-common/operation-processors/schema-consistency-processor', 'orbit-common/lib/exceptions'], function (exports, Orbit, assert, objects, Source, CacheIntegrityProcessor, SchemaConsistencyProcessor, exceptions) {
+define('orbit-common/memory-source', ['exports', 'orbit/main', 'orbit/lib/assert', 'orbit/lib/exceptions', 'orbit/lib/objects', 'orbit/lib/eq', 'orbit-common/source', 'orbit-common/operation-processors/cache-integrity-processor', 'orbit-common/operation-processors/schema-consistency-processor', 'orbit-common/lib/exceptions'], function (exports, Orbit, assert, exceptions, objects, eq, Source, CacheIntegrityProcessor, SchemaConsistencyProcessor, lib__exceptions) {
 
   'use strict';
 
   var MemorySource = Source['default'].extend({
-    init: function(schema, options) {
+    init: function(options) {
+      assert.assert('MemorySource constructor requires `options`', options);
       assert.assert('MemorySource requires Orbit.Promise to be defined', Orbit['default'].Promise);
-      options = options || {};
       options.useCache = true;
       options.cacheOptions = options.cacheOptions || {};
       options.cacheOptions.processors =  options.cacheOptions.processors || [SchemaConsistencyProcessor['default'], CacheIntegrityProcessor['default']];
-      this._super.call(this, schema, options);
+      this._super.call(this, options);
     },
 
     /////////////////////////////////////////////////////////////////////////////
@@ -627,131 +631,43 @@ define('orbit-common/memory-source', ['exports', 'orbit/main', 'orbit/lib/assert
     /////////////////////////////////////////////////////////////////////////////
 
     _find: function(type, id, options) {
-      var _this = this,
-          modelDefinition = this.schema.modelDefinition(type),
-          pk = modelDefinition.primaryKey.name,
-          result;
+      var _this = this;
 
-      options = options || {};
+      if (options) throw new exceptions.Exception('`MemorySource#find` does not support `options` argument');
 
-      return new Orbit['default'].Promise(function(resolve, reject) {
+      return new Orbit['default'].Promise(function(resolve) {
+        var result;
+
         if (objects.isNone(id)) {
-          result = _this._filter.call(_this, type);
+          result = _this._fetchAll(type);
 
         } else if (objects.isArray(id)) {
-          var res,
-              resId,
-              notFound;
-
-          result = [];
-          notFound = [];
-
-          for (var i = 0, l = id.length; i < l; i++) {
-            resId = id[i];
-
-            res = _this.retrieve([type, resId]);
-
-            if (res) {
-              result.push(res);
-            } else {
-              notFound.push(resId);
-            }
-          }
-
-          if (notFound.length > 0) {
-            result = null;
-            id = notFound;
-          }
-          else if (options.include) {
-            _this._fetchRecords(type, id, options);
-          }
-
-        } else if (id !== null && typeof id === 'object') {
-          if (id[pk]) {
-            result = _this._fetchRecord(type, id[pk], options);
-
-          } else {
-            result = _this._filter.call(_this, type, id);
-
-            // If all keys in our query were keys, always return a single record.
-            if (Object.keys(id).every(function(key) {
-              return modelDefinition.keys[key];
-            })) {
-              result = result[0];
-            }
-          }
+          result = _this._fetchMany(type, id);
 
         } else {
-          result = _this._fetchRecord(type, id, options);
+          result = _this._fetchOne(type, id);
         }
 
-        if (result) {
-          resolve(result);
-        } else {
-          reject(new exceptions.RecordNotFoundException(type, id));
-        }
+        resolve(result);
       });
     },
 
-    _fetchRecords: function(type, ids, options) {
-      var records = [];
-
-      for (var i = 0, l = ids.length; i < l; i++) {
-        var record = this._fetchRecord(type, ids[i], options);
-        records.push(record);
-      }
-
-      return records;
-    },
-
-    _fetchRecord: function(type, id, options) {
+    _query: function(type, query, options) {
       var _this = this;
-      var record = this.retrieve([type, id]);
-      if (!record) throw new exceptions.RecordNotFoundException(type, id);
 
-      var include = this._parseInclude(options.include);
+      if (options) throw new exceptions.Exception('`MemorySource#query` does not support `options` argument');
 
-      if (include) {
-        Object.keys(include).forEach(function(link) {
-          _this._fetchLinked(type, id, link, objects.merge(options, {include: include[link]}));
-        });
-      }
+      return new Orbit['default'].Promise(function(resolve) {
+        var result = _this._filter(type, query);
 
-      return record;
-    },
-
-    _fetchLinked: function(type, id, link, options) {
-      var linkType = this.schema.modelDefinition(type).links[link].model;
-      var linkValue = this.retrieveLink(type, id, link);
-
-      if (linkValue === undefined) throw new exceptions.LinkNotFoundException(type, id, link);
-      if (linkValue === null) return null;
-
-      return objects.isArray(linkValue)
-             ? this._fetchRecords(linkType, linkValue, options)
-             : this._fetchRecord(linkType, linkValue, options);
-    },
-
-    _parseInclude: function(include) {
-      if (!include) return undefined;
-      if (objects.isObject(include) && !objects.isArray(include)) return include;
-      if (!objects.isArray(include)) include = [include];
-
-      var parsed = {};
-
-      include.forEach(function(inclusion) {
-        var current = parsed;
-        inclusion.split(".").forEach(function(link) {
-          current[link] = current[link] || {};
-          current = current[link];
-        });
+        resolve(result);
       });
-
-      return parsed;
     },
 
-    _findLink: function(type, id, link) {
+    _findLink: function(type, id, link, options) {
       var _this = this;
+
+      if (options) throw new exceptions.Exception('`MemorySource#findLink` does not support `options` argument');
 
       return new Orbit['default'].Promise(function(resolve, reject) {
         id = _this.getId(type, id);
@@ -776,18 +692,92 @@ define('orbit-common/memory-source', ['exports', 'orbit/main', 'orbit/lib/assert
             resolve(relId);
 
           } else {
-            reject(new exceptions.LinkNotFoundException(type, id, link));
+            reject(new lib__exceptions.LinkNotFoundException(type, id, link));
           }
 
         } else {
-          reject(new exceptions.RecordNotFoundException(type, id));
+          reject(new lib__exceptions.RecordNotFoundException(type, id));
         }
+      });
+    },
+
+    _findLinked: function(type, id, link, options) {
+      var _this = this;
+
+      if (options) throw new exceptions.Exception('`MemorySource#findLinked` does not support `options` argument');
+
+      return new Orbit['default'].Promise(function(resolve) {
+        var result = _this._fetchLinked(type, id, link);
+
+        resolve(result);
       });
     },
 
     /////////////////////////////////////////////////////////////////////////////
     // Internals
     /////////////////////////////////////////////////////////////////////////////
+
+    _fetchAll: function(type) {
+      var records = [];
+      var dataForType = this.retrieve([type]);
+
+      if (!dataForType) throw new lib__exceptions.RecordNotFoundException(type);
+
+      for (var i in dataForType) {
+        if (dataForType.hasOwnProperty(i)) {
+          records.push( dataForType[i] );
+        }
+      }
+
+      return records;
+    },
+
+    _fetchMany: function(type, ids) {
+      var _this = this;
+      var records = [];
+      var notFound = [];
+      var id;
+      var record;
+
+      for (var i = 0, l = ids.length; i < l; i++) {
+        id = _this.getId(type, ids[i]);
+        record = this.retrieve([type, id]);
+
+        if (record) {
+          records.push(record);
+        } else {
+          notFound.push(id);
+        }
+      }
+
+      if (notFound.length > 0) throw new lib__exceptions.RecordNotFoundException(type, notFound);
+
+      return records;
+    },
+
+    _fetchOne: function(type, id) {
+      id = this.getId(type, id);
+
+      var record = this.retrieve([type, id]);
+
+      if (!record) throw new lib__exceptions.RecordNotFoundException(type, id);
+
+      return record;
+    },
+
+    _fetchLinked: function(type, id, link) {
+      id = this.getId(type, id);
+
+      var linkType = this.schema.modelDefinition(type).links[link].model;
+      var linkValue = this.retrieveLink(type, id, link);
+
+      if (linkValue === undefined) throw new lib__exceptions.LinkNotFoundException(type, id, link);
+      if (linkValue === null) return null;
+
+      return objects.isArray(linkValue)
+             ? this._fetchMany(linkType, linkValue)
+             : this._fetchOne(linkType, linkValue);
+    },
 
     _filter: function(type, query) {
       var all = [],
@@ -798,44 +788,25 @@ define('orbit-common/memory-source', ['exports', 'orbit/main', 'orbit/lib/assert
           record;
 
       dataForType = this.retrieve([type]);
+      if (!dataForType) throw new lib__exceptions.RecordNotFoundException(type, query);
 
       for (i in dataForType) {
         if (dataForType.hasOwnProperty(i)) {
           record = dataForType[i];
-          if (query === undefined) {
-            match = true;
-          } else {
-            match = false;
-            for (prop in query) {
-              if (record[prop] === query[prop]) {
-                match = true;
-              } else {
-                match = false;
-                break;
-              }
+          match = false;
+          for (prop in query) {
+            if (eq.eq(record[prop], query[prop])) {
+              match = true;
+            } else {
+              match = false;
+              break;
             }
           }
           if (match) all.push(record);
         }
       }
+
       return all;
-    },
-
-    _filterOne: function(type, prop, value) {
-      var dataForType,
-          i,
-          record;
-
-      dataForType = this.retrieve([type]);
-
-      for (i in dataForType) {
-        if (dataForType.hasOwnProperty(i)) {
-          record = dataForType[i];
-          if (record[prop] === value) {
-            return record;
-          }
-        }
-      }
     }
   });
 
@@ -1650,12 +1621,40 @@ define('orbit-common/schema', ['exports', 'orbit/lib/objects', 'orbit/lib/uuid',
       return record;
     },
 
+    /**
+     A hook that can be used to define a model that's not yet defined.
+
+     This allows for schemas to lazily define models, rather than requiring
+     full definitions upfront.
+
+     @method modelNotDefined
+     @param {String} [model] name of model
+     */
+    modelNotDefined: null,
+
+    /**
+     Look up a model definition.
+
+     If none can be found, `modelNotDefined` will be triggered, which provides
+     an opportunity for lazily defining models.
+
+     If still no model has been defined, a `ModelNotRegisteredException` is
+     raised.
+
+     @method modelDefinition
+     @param {String} [model] name of model
+     @return {Object} model definition
+     */
     modelDefinition: function(model) {
-      var modelSchema = this.models[model];
-      if (!modelSchema) {
+      var modelDefinition = this.models[model];
+      if (!modelDefinition && this.modelNotDefined) {
+        this.modelNotDefined(model);
+        modelDefinition = this.models[model];
+      }
+      if (!modelDefinition) {
         throw new exceptions.ModelNotRegisteredException(model);
       }
-      return modelSchema;
+      return modelDefinition;
     },
 
     initDefaults: function(model, record) {
@@ -1914,21 +1913,18 @@ define('orbit-common/source', ['exports', 'orbit/main', 'orbit/document', 'orbit
   'use strict';
 
   var Source = objects.Class.extend({
-    init: function(schema, options) {
-      assert.assert("Source's `schema` must be specified", schema);
-
-      this.schema = schema;
-
-      options = options || {};
+    init: function(options) {
+      assert.assert('Source constructor requires `options`', options);
+      assert.assert("Source's `schema` must be specified in `options.schema` constructor argument", options.schema);
+      this.schema = options.schema;
 
       // Create an internal cache and expose some elements of its interface
       if (options.useCache) {
-        this._cache = new Cache['default'](schema, options.cacheOptions);
-        objects.expose(this, this._cache, 'length', 'reset', 'retrieve', 'retrieveLink', 'exists', 'hasDeleted');
+        this._cache = new Cache['default'](this.schema, options.cacheOptions);
       }
 
       Transformable['default'].extend(this);
-      Requestable['default'].extend(this, ['find', 'add', 'update', 'patch', 'remove',
+      Requestable['default'].extend(this, ['find', 'query', 'add', 'update', 'patch', 'remove',
                                 'findLink', 'addLink', 'removeLink', 'updateLink',
                                 'findLinked']);
 
@@ -2015,18 +2011,11 @@ define('orbit-common/source', ['exports', 'orbit/main', 'orbit/document', 'orbit
 
     _find: stubs.required,
 
+    _query: stubs.required,
+
     _findLink: stubs.required,
 
-    _findLinked: function(type, id, link, options) {
-      var modelId = this.getId(type, id);
-      var linkType = this.schema.linkDefinition(type, link).model;
-      var linkValue = this.retrieveLink(type, modelId, link);
-
-      if (linkValue === undefined) throw new exceptions.LinkNotFoundException(type, id, link);
-      if (linkValue === null) return null;
-
-      return this._find(linkType, linkValue, options);
-    },
+    _findLinked: stubs.required,
 
     _add: function(type, data) {
       data = data || {};
@@ -2091,6 +2080,127 @@ define('orbit-common/source', ['exports', 'orbit/main', 'orbit/document', 'orbit
     // Helpers
     /////////////////////////////////////////////////////////////////////////////
 
+    reset: function(data) {
+      assert.assert('`Source#reset` requires a cache.', this._cache);
+
+      return this._cache.reset(data);
+    },
+
+    /**
+     Return data at a particular path.
+
+     Returns `undefined` if the path does not exist in the document.
+
+     @method retrieve
+     @param path
+     @returns {Object}
+     */
+    retrieve: function(path) {
+      assert.assert('`Source#retrieve` requires a cache.', this._cache);
+
+      return this._cache.retrieve(path);
+    },
+
+    /**
+     Retrieves a link's value.
+
+     Returns a null value for empty links.
+     For hasOne links will return a string id value of the link.
+     For hasMany links will return an array of id values.
+
+     @param {String} [type] Model type
+     @param {String} [id]   Model ID
+     @param {String} [link] Link key
+     @returns {Array|String|null} Value of the link
+     */
+    retrieveLink: function(type, id, link) {
+      assert.assert('`Source#retrieveLink` requires a cache.', this._cache);
+
+      var val = this.retrieve([type, id, '__rel', link]);
+      if (objects.isObject(val)) {
+        val = Object.keys(val);
+      }
+      return val;
+    },
+
+    /**
+     Return the size of data at a particular path
+
+     @method length
+     @param path
+     @returns {Number}
+     */
+    length: function(path) {
+      assert.assert('`Source#length` requires a cache.', this._cache);
+
+      var data = this.retrieve(path);
+      if (objects.isArray(data)) {
+        return data.length;
+      } else if (objects.isObject(data)) {
+        return Object.keys(data).length;
+      } else {
+        return 0;
+      }
+    },
+
+    /**
+     Returns whether a path exists in the source's cache.
+
+     @method exists
+     @param path
+     @returns {Boolean}
+     */
+    exists: function(path) {
+      assert.assert('`Source#exists` requires a cache.', this._cache);
+
+      return this.retrieve(path) !== undefined;
+    },
+
+    /**
+     Returns whether a path has been removed from the source's cache.
+
+     @method hasDeleted
+     @param path
+     @returns {Boolean}
+     */
+    hasDeleted: function(path) {
+      assert.assert('`Source#hasDeleted` requires a cache.', this._cache);
+
+      return this._cache.hasDeleted(path);
+    },
+
+    normalize: function(type, data) {
+      return this.schema.normalize(type, data);
+    },
+
+    initDefaults: function(type, record) {
+      return this.schema.initDefaults(type, record);
+    },
+
+    getId: function(type, data) {
+      if (objects.isObject(data)) {
+        var modelDefinition = this.schema.modelDefinition(type);
+
+        if (data[modelDefinition.primaryKey.name]) {
+          return data[modelDefinition.primaryKey.name];
+
+        } else {
+          var secondaryKeys = modelDefinition.secondaryKeys;
+
+          for (var key in secondaryKeys) {
+            var value = data[key];
+            if (value) return secondaryKeys[key].secondaryToPrimaryKeyMap[value];
+          }
+        }
+      } else {
+        return data;
+      }
+    },
+
+    /////////////////////////////////////////////////////////////////////////////
+    // Internals
+    /////////////////////////////////////////////////////////////////////////////
+
     _normalizeId: function(type, id) {
       if (objects.isObject(id)) {
         var record = this.normalize(type, id);
@@ -2105,12 +2215,14 @@ define('orbit-common/source', ['exports', 'orbit/main', 'orbit/document', 'orbit
         var relatedRecord;
 
         if (objects.isArray(value)) {
-          for (var i = 0, l = value.length; i < l; i++) {
-            if (objects.isObject(value[i])) {
-              relatedRecord = this.normalize(linkDef.model, value[i]);
-              value[i] = this.getId(linkDef.model, relatedRecord);
+          value = value.map(function(each) {
+            if (objects.isObject(each)) {
+              relatedRecord = this.normalize(linkDef.model, each);
+              return this.getId(linkDef.model, relatedRecord);
+            } else {
+              return each;
             }
-          }
+          }, this);
 
         } else {
           relatedRecord = this.normalize(linkDef.model, value);
@@ -2119,26 +2231,6 @@ define('orbit-common/source', ['exports', 'orbit/main', 'orbit/document', 'orbit
       }
       return value;
     },
-
-    normalize: function(type, data) {
-      return this.schema.normalize(type, data);
-    },
-
-    initDefaults: function(type, record) {
-      return this.schema.initDefaults(type, record);
-    },
-
-    getId: function(type, data) {
-      if (objects.isObject(data)) {
-        return data[this.schema.modelDefinition(type).primaryKey.name];
-      } else {
-        return data;
-      }
-    },
-
-    /////////////////////////////////////////////////////////////////////////////
-    // Internals
-    /////////////////////////////////////////////////////////////////////////////
 
     _isLinkEmpty: function(linkType, linkValue) {
       return (linkType === 'hasMany' && linkValue && linkValue.length === 0 ||
@@ -2158,6 +2250,97 @@ define('orbit-common/source', ['exports', 'orbit/main', 'orbit/document', 'orbit
   Source.created = function(/* source */) {};
 
   exports['default'] = Source;
+
+});
+define('orbit-common/transaction', ['exports', 'orbit/main', 'orbit-common/memory-source', 'orbit/lib/assert', 'orbit/lib/operations'], function (exports, Orbit, MemorySource, assert, lib__operations) {
+
+  'use strict';
+
+  var Transaction = MemorySource['default'].extend({
+    active: false,
+    isolated: false,
+    operations: null,
+    inverseOperations: null,
+
+    init: function(options) {
+      assert.assert('Transaction constructor requires `options`', options);
+      assert.assert('`baseSource` must be supplied as an option when constructing a Transaction.', options.baseSource);
+      var baseSource = this.baseSource = options.baseSource;
+
+      options.schema = baseSource.schema;
+
+      this._super(options);
+
+      if (options.isolated !== undefined) {
+        this.isolated = options.isolated;
+      }
+
+      if (options.active !== false) {
+        this.begin();
+      }
+    },
+
+    begin: function() {
+      this.operations = [];
+      this.inverseOperations = [];
+
+      this._activate();
+    },
+
+    commit: function() {
+      this._deactivate();
+
+      var operations = this.operations;
+
+      if (operations.length > 0) {
+        operations = lib__operations.coalesceOperations(operations);
+        return this.baseSource.transform(operations);
+
+      } else {
+        return Orbit['default'].Promise.resolve();
+      }
+    },
+
+    retrieve: function(path) {
+      var result = this._super.apply(this, arguments);
+      if (result === undefined && !this.isolated) {
+        result = this.baseSource.retrieve(path);
+        if (result !== undefined) {
+          this._cloneData(path, result);
+        }
+      }
+      return result;
+    },
+
+    _cloneData: function(path, value) {
+      this._cache.transform([{
+        op: 'add',
+        path: path,
+        value: value
+      }]);
+    },
+
+    _activate: function() {
+      if (!this.active) {
+        this.on('didTransform', this._processTransform, this);
+        this.active = true;
+      }
+    },
+
+    _deactivate: function() {
+      if (this.active) {
+        this.off('didTransform', this._processTransform, this);
+        this.active = false;
+      }
+    },
+
+    _processTransform: function(transform, result) {
+      Array.prototype.push.apply(this.operations, result.operations);
+      Array.prototype.push.apply(this.inverseOperations, result.inverseOperations);
+    }
+  });
+
+  exports['default'] = Transaction;
 
 });
 window.OC = requireModule("orbit-common")["default"];

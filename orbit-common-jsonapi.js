@@ -342,24 +342,24 @@ define('orbit-common/jsonapi-serializer', ['exports', 'orbit-common/serializer',
   });
 
 });
-define('orbit-common/jsonapi-source', ['exports', 'orbit/main', 'orbit/lib/assert', 'orbit/lib/objects', 'orbit/operation', 'orbit/action-queue', 'orbit-common/source', 'orbit-common/serializer', 'orbit-common/jsonapi-serializer', 'orbit-common/lib/exceptions', 'orbit/transform-result', 'orbit-common/operation-processors/cache-integrity-processor', 'orbit-common/operation-processors/deletion-tracking-processor', 'orbit-common/operation-processors/schema-consistency-processor'], function (exports, Orbit, assert, objects, Operation, ActionQueue, Source, Serializer, JSONAPISerializer, exceptions, TransformResult, CacheIntegrityProcessor, DeletionTrackingProcessor, SchemaConsistencyProcessor) {
+define('orbit-common/jsonapi-source', ['exports', 'orbit/main', 'orbit/lib/assert', 'orbit/lib/exceptions', 'orbit/lib/objects', 'orbit/operation', 'orbit/action-queue', 'orbit-common/source', 'orbit-common/serializer', 'orbit-common/jsonapi-serializer', 'orbit-common/lib/exceptions', 'orbit/transform-result', 'orbit-common/operation-processors/cache-integrity-processor', 'orbit-common/operation-processors/deletion-tracking-processor', 'orbit-common/operation-processors/schema-consistency-processor'], function (exports, Orbit, assert, exceptions, objects, Operation, ActionQueue, Source, Serializer, JSONAPISerializer, lib__exceptions, TransformResult, CacheIntegrityProcessor, DeletionTrackingProcessor, SchemaConsistencyProcessor) {
 
   'use strict';
 
   exports['default'] = Source['default'].extend({
 
-    init: function(schema, options) {
+    init: function(options) {
+      assert.assert('JSONAPISource constructor requires `options`', options);
       assert.assert('JSONAPISource requires Orbit.Promise be defined', Orbit['default'].Promise);
       assert.assert('JSONAPISource requires Orbit.ajax be defined', Orbit['default'].ajax);
 
-      options = options || {};
       options.useCache = options.useCache !== undefined ? options.useCache : true;
       if (options.useCache) {
         options.cacheOptions = options.cacheOptions || {};
         options.cacheOptions.processors =  options.cacheOptions.processors || [SchemaConsistencyProcessor['default'], CacheIntegrityProcessor['default'], DeletionTrackingProcessor['default']];
       }
 
-      this._super.call(this, schema, options);
+      this._super.call(this, options);
 
       this.namespace        = options.namespace || this.namespace;
       this.host             = options.host || this.host;
@@ -375,7 +375,7 @@ define('orbit-common/jsonapi-source', ['exports', 'orbit/main', 'orbit/lib/asser
         this.SerializerClass = this.SerializerClass.wrappedFunction;
       }
 
-      this.serializer = new this.SerializerClass(schema);
+      this.serializer = new this.SerializerClass(this.schema);
 
       assert.assert('Serializer must be an instance of OC.Serializer', this.serializer instanceof Serializer['default']);
     },
@@ -419,27 +419,27 @@ define('orbit-common/jsonapi-source', ['exports', 'orbit/main', 'orbit/lib/asser
     // Requestable interface implementation
     /////////////////////////////////////////////////////////////////////////////
 
-    _find: function(type, id) {
-      if (id && (typeof id === 'number' || typeof id === 'string')) {
-        return this._findOne(type, id);
+    _find: function(type, id, options) {
+      if (options) throw new exceptions.Exception('`JSONAPISource#findLink` does not support `options` argument');
 
-      } else if (id && objects.isArray(id)) {
+      if (objects.isNone(id)) {
+        return this._findAll(type);
+
+      } else if (objects.isArray(id)) {
         return this._findMany(type, id);
 
       } else {
-        var resourceKey = this.serializer.resourceKey(type);
-
-        if (id && typeof id === 'object' && id[resourceKey]) {
-          return this._findOne(type, id);
-
-        } else {
-          return this._findQuery(type, id);
-        }
+        return this._findOne(type, id);
       }
     },
 
-    _findLink: function(type, id, link) {
+    _findLink: function(type, id, link, options) {
       var _this = this;
+
+      if (options) throw new exceptions.Exception('`JSONAPISource#findLink` does not support `options` argument');
+
+      id = this.getId(type, id);
+
       return this.ajax(this.resourceLinkURL(type, id, link), 'GET').then(
         function(raw) {
           var relId = _this.serializer.deserializeLink(raw.data);
@@ -448,24 +448,39 @@ define('orbit-common/jsonapi-source', ['exports', 'orbit/main', 'orbit/lib/asser
       );
     },
 
-   _findLinked: function(type, id, link, relId) {
+   _findLinked: function(type, id, link, options) {
      var _this = this;
 
-     if (relId === undefined) {
-       return this.ajax(this.resourceLinkedURL(type, id, link), 'GET').then(
-         function(raw) {
-           var linkDef = _this.schema.linkDefinition(type, link);
+     if (options) throw new exceptions.Exception('`JSONAPISource#findLinked` does not support `options` argument');
 
-           var result = _this.deserialize(linkDef.model, null, raw);
+     id = this.getId(type, id);
 
-           return _this.transformed(result.result).then(function() {
-             return result.data;
-           });
-         }
-       );
-     } else {
-       return this._super.apply(this, arguments);
-     }
+     return this.ajax(this.resourceLinkedURL(type, id, link), 'GET').then(
+       function(raw) {
+         var linkDef = _this.schema.linkDefinition(type, link);
+
+         var result = _this.deserialize(linkDef.model, null, raw);
+
+         return _this.transformed(result.result).then(function() {
+           return result.data;
+         });
+       }
+     );
+   },
+
+   _query: function(type, query, options) {
+     var _this = this;
+
+     if (options) throw new exceptions.Exception('`JSONAPISource#query` does not support `options` argument');
+
+     return this.ajax(this.resourceURL(type), 'GET', {data: {filter: query}}).then(
+       function(raw) {
+         var deserialized = _this.deserialize(type, null, raw);
+         return _this.transformed(deserialized.result).then(function() {
+           return deserialized.data;
+         });
+       }
+     );
    },
 
     /////////////////////////////////////////////////////////////////////////////
@@ -708,6 +723,18 @@ define('orbit-common/jsonapi-source', ['exports', 'orbit/main', 'orbit/lib/asser
       };
     },
 
+    _findAll: function(type) {
+      var _this = this;
+      return this.ajax(this.resourceURL(type), 'GET').then(
+        function(raw) {
+          var deserialized = _this.deserialize(type, null, raw);
+          return _this.transformed(deserialized.result).then(function() {
+            return deserialized.data;
+          });
+        }
+      );
+    },
+
     _findOne: function(type, id) {
       var _this = this;
       return this.ajax(this.resourceURL(type, id), 'GET').then(
@@ -723,19 +750,6 @@ define('orbit-common/jsonapi-source', ['exports', 'orbit/main', 'orbit/lib/asser
     _findMany: function(type, ids) {
       var _this = this;
       return this.ajax(this.resourceURL(type, ids), 'GET').then(
-        function(raw) {
-          var deserialized = _this.deserialize(type, null, raw);
-          return _this.transformed(deserialized.result).then(function() {
-            return deserialized.data;
-          });
-        }
-      );
-    },
-
-    _findQuery: function(type, query) {
-      var _this = this;
-
-      return this.ajax(this.resourceURL(type), 'GET', {data: {filter: query}}).then(
         function(raw) {
           var deserialized = _this.deserialize(type, null, raw);
           return _this.transformed(deserialized.result).then(function() {

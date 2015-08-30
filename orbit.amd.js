@@ -1,4 +1,4 @@
-define('orbit', ['exports', 'orbit/main', 'orbit/action', 'orbit/action-queue', 'orbit/document', 'orbit/evented', 'orbit/notifier', 'orbit/operation', 'orbit/requestable', 'orbit/request-connector', 'orbit/transaction', 'orbit/transformable', 'orbit/transform', 'orbit/transform-connector', 'orbit/lib/assert', 'orbit/lib/config', 'orbit/lib/deprecate', 'orbit/lib/diffs', 'orbit/lib/eq', 'orbit/lib/exceptions', 'orbit/lib/functions', 'orbit/lib/objects', 'orbit/lib/operations', 'orbit/lib/strings', 'orbit/lib/stubs', 'orbit/lib/uuid'], function (exports, Orbit, Action, ActionQueue, Document, Evented, Notifier, Operation, Requestable, RequestConnector, Transaction, Transformable, Transform, TransformConnector, assert, config, deprecate, diffs, eq, exceptions, functions, objects, operations, strings, stubs, uuid) {
+define('orbit', ['exports', 'orbit/main', 'orbit/action', 'orbit/action-queue', 'orbit/document', 'orbit/evented', 'orbit/notifier', 'orbit/operation', 'orbit/requestable', 'orbit/request-connector', 'orbit/transformable', 'orbit/transform', 'orbit/transform-connector', 'orbit/lib/assert', 'orbit/lib/config', 'orbit/lib/deprecate', 'orbit/lib/diffs', 'orbit/lib/eq', 'orbit/lib/exceptions', 'orbit/lib/functions', 'orbit/lib/objects', 'orbit/lib/operations', 'orbit/lib/strings', 'orbit/lib/stubs', 'orbit/lib/uuid'], function (exports, Orbit, Action, ActionQueue, Document, Evented, Notifier, Operation, Requestable, RequestConnector, Transformable, Transform, TransformConnector, assert, config, deprecate, diffs, eq, exceptions, functions, objects, operations, strings, stubs, uuid) {
 
   'use strict';
 
@@ -14,7 +14,6 @@ define('orbit', ['exports', 'orbit/main', 'orbit/action', 'orbit/action-queue', 
   Orbit['default'].Operation = Operation['default'];
   Orbit['default'].Requestable = Requestable['default'];
   Orbit['default'].RequestConnector = RequestConnector['default'];
-  Orbit['default'].Transaction = Transaction['default'];
   Orbit['default'].Transformable = Transformable['default'];
   Orbit['default'].Transform = Transform['default'];
   Orbit['default'].TransformConnector = TransformConnector['default'];
@@ -2178,57 +2177,6 @@ define('orbit/requestable', ['exports', 'orbit/evented', 'orbit/lib/assert', 'or
   };
 
   exports['default'] = Requestable;
-
-});
-define('orbit/transaction', ['exports', 'orbit/lib/objects'], function (exports, objects) {
-
-  'use strict';
-
-  var Transaction = objects.Class.extend({
-    inverseOperations: null,
-
-    init: function(source, options) {
-      this.source = source;
-
-      options = options || {};
-      var active = options.active !== undefined ? options.active : true;
-      if (active) this.begin();
-    },
-
-    begin: function() {
-      this.inverseOperations = [];
-      this._activate();
-    },
-
-    commit: function() {
-      this._deactivate();
-    },
-
-    rollback: function() {
-      this._deactivate();
-      return this.source.transform(this.inverseOperations);
-    },
-
-    /////////////////////////////////////////////////////////////////////////////
-    // Internals
-    /////////////////////////////////////////////////////////////////////////////
-
-    _activate: function() {
-      this.source.on('didTransform', this._processTransform, this);
-      this.active = true;
-    },
-
-    _deactivate: function() {
-      this.source.off('didTransform', this._processTransform, this);
-      this.active = false;
-    },
-
-    _processTransform: function(transform, result) {
-      Array.prototype.push.apply(this.inverseOperations, result.inverseOperations);
-    }
-  });
-
-  exports['default'] = Transaction;
 
 });
 define('orbit/transform-connector', ['exports', 'orbit/lib/assert', 'orbit/lib/objects'], function (exports, assert, objects) {
