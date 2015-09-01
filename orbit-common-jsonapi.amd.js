@@ -1,4 +1,4 @@
-define('orbit-common/jsonapi-serializer', ['exports', 'orbit-common/serializer', 'orbit/lib/objects'], function (exports, Serializer, objects) {
+define('orbit-common/jsonapi-serializer', ['exports', 'orbit-common/serializer', 'orbit/lib/objects', 'orbit/lib/strings'], function (exports, Serializer, objects, strings) {
 
   'use strict';
 
@@ -8,27 +8,27 @@ define('orbit-common/jsonapi-serializer', ['exports', 'orbit-common/serializer',
     },
 
     resourceType: function(type) {
-      return this.schema.pluralize(type);
+      return strings.dasherize( this.schema.pluralize(type) );
     },
 
     resourceLink: function(type, link) {
-      return link;
+      return strings.dasherize( link );
     },
 
     resourceAttr: function(type, attr) {
-      return attr;
+      return strings.dasherize( attr );
     },
 
     typeFromResourceType: function(resourceType) {
-      return this.schema.singularize(resourceType);
+      return strings.camelize( this.schema.singularize(resourceType) );
     },
 
     attrFromResourceAttr: function(type, resourceAttr) {
-      return resourceAttr;
+      return strings.camelize( resourceAttr );
     },
 
     linkFromResourceLink: function(type, resourceLink) {
-      return resourceLink;
+      return strings.camelize( resourceLink );
     },
 
     resourceId: function(type, id) {

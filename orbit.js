@@ -151,6 +151,10 @@ define('orbit', ['exports', 'orbit/main', 'orbit/action', 'orbit/action-queue', 
   Orbit['default'].isNone = objects.isNone;
   Orbit['default'].coalesceOperations = operations.coalesceOperations;
   Orbit['default'].capitalize = strings.capitalize;
+  Orbit['default'].camelize = strings.camelize;
+  Orbit['default'].decamelize = strings.decamelize;
+  Orbit['default'].dasherize = strings.dasherize;
+  Orbit['default'].underscore = strings.underscore;
   Orbit['default'].noop = stubs.noop;
   Orbit['default'].required = stubs.required;
   Orbit['default'].uuid = uuid.uuid;
@@ -1676,7 +1680,7 @@ define('orbit/lib/objects', ['exports', 'orbit/lib/eq'], function (exports, eq) 
   exports.merge = merge;
 
 });
-define('orbit/lib/operations', ['exports', 'orbit/lib/objects', 'orbit/document', 'orbit/lib/eq', 'orbit/operation'], function (exports, objects, Document, eq, Operation) {
+define('orbit/lib/operations', ['exports', 'orbit/lib/objects', 'orbit/lib/eq', 'orbit/document', 'orbit/operation'], function (exports, objects, eq, Document, Operation) {
 
   'use strict';
 
@@ -1684,11 +1688,17 @@ define('orbit/lib/operations', ['exports', 'orbit/lib/objects', 'orbit/document'
   exports.normalizeOperation = normalizeOperation;
   exports.normalizeOperations = normalizeOperations;
 
-  function _requiresMerge(superceded, superceding) {
-    return (
-      superceded.path.join("/").indexOf(superceding.path.join("/")) === 0 ||
-      superceding.path.join("/").indexOf(superceded.path.join("/")) === 0
+  function _shouldMerge(supercededOp, supercedingOp, consecutiveOps) {
+    var pathsOverlap = (
+      supercededOp.path.join("/").indexOf(supercedingOp.path.join("/")) === 0 ||
+      supercedingOp.path.join("/").indexOf(supercededOp.path.join("/")) === 0
     );
+
+    // In order to allow merging of operations, their paths must overlap
+    // and the operations must either be consecutive or the superceding
+    // operation must only change a field (not a relationship).
+    return pathsOverlap &&
+           (consecutiveOps || _valueTypeForPath(supercedingOp.path) === 'field');
   }
 
   function _valueTypeForPath(path) {
@@ -1838,7 +1848,10 @@ define('orbit/lib/operations', ['exports', 'orbit/lib/objects', 'orbit/document'
   }
 
   /**
-   Coalesces operations into a minimal set of equivalent operations
+   Coalesces operations into a minimal set of equivalent operations.
+
+   This method respects the order of the operations array and does not allow
+   reordering of operations that affect relationships.
 
    @method coalesceOperations
    @for Orbit
@@ -1846,23 +1859,34 @@ define('orbit/lib/operations', ['exports', 'orbit/lib/objects', 'orbit/document'
    @returns {Array}
    */
   function coalesceOperations(operations) {
-    var coalesced = [];
-    var superceding;
+    var coalescedOps = [];
+    var currentOp;
+    var nextOp;
+    var consecutiveOps;
 
-    operations.forEach(function(superceding) {
-      coalesced.slice(0).forEach(function(superceded) {
+    for (var i = 0, l = operations.length; i < l; i++) {
+      currentOp = operations[i];
 
-        if (_requiresMerge(superceded, superceding)) {
-          var index = coalesced.indexOf(superceded);
-          coalesced.splice(index, 1);
-          superceding = _merge(superceded, superceding);
+      if (currentOp) {
+        consecutiveOps = true;
+
+        for (var j = i + 1; j < l; j++) {
+          nextOp = operations[j];
+          if (nextOp) {
+            if (_shouldMerge(currentOp, nextOp, consecutiveOps)) {
+              currentOp = _merge(currentOp, nextOp);
+              operations[j] = undefined;
+            } else {
+              consecutiveOps = false;
+            }
+          }
         }
 
-      });
-      coalesced.push(superceding);
-    });
+        coalescedOps.push(currentOp);
+      }
+    }
 
-    return coalesced;
+    return coalescedOps;
   }
 
   function normalizeOperation(operation) {
@@ -1883,8 +1907,7 @@ define('orbit/lib/strings', ['exports'], function (exports) {
   'use strict';
 
   /**
-   Uppercase the first letter of a string. The remainder of the string won't
-   be affected.
+   Uppercase the first letter of a string, but don't change the remainder.
 
    @method capitalize
    @for Orbit
@@ -1895,7 +1918,70 @@ define('orbit/lib/strings', ['exports'], function (exports) {
     return str.charAt(0).toUpperCase() + str.slice(1);
   };
 
+  /**
+   Convert underscored, dasherized, or space-delimited words into lowerCamelCase.
+
+   @method camelize
+   @for Orbit
+   @param {String} str
+   @returns {String} camelized string
+   */
+  var camelize = function(str) {
+    return str
+      .replace(/(\-|\_|\.|\s)+(.)?/g, function(match, separator, chr) {
+        return chr ? chr.toUpperCase() : '';
+      })
+      .replace(/(^|\/)([A-Z])/g, function(match, separator, chr) {
+        return match.toLowerCase();
+      });
+  };
+
+  /**
+   Converts a camelized string into all lowercase separated by underscores.
+
+   @method decamelize
+   @for Orbit
+   @param {String} str
+   @returns {String} lower case, underscored string
+   */
+  var decamelize = function(str) {
+    return str
+      .replace(/([a-z\d])([A-Z])/g, '$1_$2')
+      .toLowerCase();
+  };
+
+  /**
+   Dasherize words that are underscored, space-delimited, or camelCased.
+
+   @method dasherize
+   @for Orbit
+   @param {String} str
+   @returns {String} dasherized string
+   */
+  var dasherize = function(str) {
+    return decamelize(str).replace(/[ _]/g, '-');
+  };
+
+  /**
+   Underscore words that are dasherized, space-delimited, or camelCased.
+
+   @method underscore
+   @for Orbit
+   @param {String} str
+   @returns {String} underscored string
+   */
+  var underscore = function(str) {
+    return str
+      .replace(/([a-z\d])([A-Z]+)/g, '$1_$2')
+      .replace(/\-|\s+/g, '_')
+      .toLowerCase();
+  };
+
   exports.capitalize = capitalize;
+  exports.camelize = camelize;
+  exports.decamelize = decamelize;
+  exports.dasherize = dasherize;
+  exports.underscore = underscore;
 
 });
 define('orbit/lib/stubs', ['exports'], function (exports) {
