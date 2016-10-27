@@ -627,8 +627,6 @@ define('orbit-common/memory-source', ['exports', 'orbit/main', 'orbit/lib/assert
     _find: function(type, id, options) {
       var _this = this;
 
-      if (options) throw new exceptions.Exception('`MemorySource#find` does not support `options` argument');
-
       return new Orbit['default'].Promise(function(resolve) {
         var result;
 
@@ -649,8 +647,6 @@ define('orbit-common/memory-source', ['exports', 'orbit/main', 'orbit/lib/assert
     _query: function(type, query, options) {
       var _this = this;
 
-      if (options) throw new exceptions.Exception('`MemorySource#query` does not support `options` argument');
-
       return new Orbit['default'].Promise(function(resolve) {
         var result = _this._filter(type, query);
 
@@ -660,8 +656,6 @@ define('orbit-common/memory-source', ['exports', 'orbit/main', 'orbit/lib/assert
 
     _findLink: function(type, id, link, options) {
       var _this = this;
-
-      if (options) throw new exceptions.Exception('`MemorySource#findLink` does not support `options` argument');
 
       return new Orbit['default'].Promise(function(resolve, reject) {
         id = _this.getId(type, id);
@@ -697,8 +691,6 @@ define('orbit-common/memory-source', ['exports', 'orbit/main', 'orbit/lib/assert
 
     _findLinked: function(type, id, link, options) {
       var _this = this;
-
-      if (options) throw new exceptions.Exception('`MemorySource#findLinked` does not support `options` argument');
 
       return new Orbit['default'].Promise(function(resolve) {
         var result = _this._fetchLinked(type, id, link);
