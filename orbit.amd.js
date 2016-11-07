@@ -1015,6 +1015,17 @@ define('orbit/lib/diffs', ['exports', 'orbit/lib/eq', 'orbit/lib/objects', 'orbi
         basePath = basePath.join('/');
       }
 
+      var basePathParts = basePath.split('/');
+      var isAttribute = basePathParts.length >= 3 && basePathParts[2] !== '__rel';
+
+      if (isAttribute) {
+        if (eq.eq(a, b)) {
+          return undefined;
+        } else {
+          return [{op: 'replace', path: basePath, value: objects.clone(b)}];
+        }
+      }
+
       var type = Object.prototype.toString.call(a);
       if (type === Object.prototype.toString.call(b)) {
         if (a !== null && typeof a === 'object') {
